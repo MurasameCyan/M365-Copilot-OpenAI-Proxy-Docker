@@ -32,6 +32,7 @@ def create_app(
     app.state.settings = resolved_settings
     app.state.token_store = AccessTokenStore(resolved_settings.access_token)
     app.state.session_store = PersistentSessionStore()
+    app.state.auto_refresh_enabled = True
     app.state.copilot_client_factory = copilot_client_factory or (
         lambda: SubstrateCopilotClient(app.state.token_store.get(), resolved_settings.time_zone)
     )
@@ -73,7 +74,7 @@ def create_app(
             return await call_next(request)
         # Skip auth for admin page and health endpoints
         path = request.url.path
-        if path in ("/", "/favicon.ico", "/healthz", "/v1/token/status", "/v1/token/update", "/v1/token/auto-capture", "/v1/cookie/inject", "/v1/chromium/login-status", "/admin/login"):
+        if path in ("/", "/favicon.ico", "/healthz", "/v1/token/status", "/v1/token/update", "/v1/token/auto-capture", "/v1/token/auto-refresh-toggle", "/v1/cookie/inject", "/v1/chromium/login-status", "/admin/login"):
             return await call_next(request)
         auth = request.headers.get("Authorization", "")
         match = re.match(r"^Bearer\s+(.+)$", auth, re.IGNORECASE)
@@ -113,7 +114,14 @@ def create_app(
 
     @app.get("/v1/token/status")
     async def token_status() -> dict:
-        return app.state.token_store.status()
+        status = app.state.token_store.status()
+        status["auto_refresh"] = app.state.auto_refresh_enabled
+        return status
+
+    @app.post("/v1/token/auto-refresh-toggle")
+    async def toggle_auto_refresh() -> dict:
+        app.state.auto_refresh_enabled = not app.state.auto_refresh_enabled
+        return {"status": "ok", "auto_refresh": app.state.auto_refresh_enabled}
 
     @app.post("/v1/token/update")
     async def update_token(request: Request) -> dict:
@@ -649,13 +657,14 @@ a:hover{text-decoration:underline}
 <div style="display:flex;gap:.75rem;margin-bottom:.25rem">
 <button id="btn-update" onclick="updateToken()" data-i18n="btn_update">更新 Token</button>
 <button id="btn-check" onclick="checkLogin()" style="background:linear-gradient(135deg,#f59e0b,#d97706)" data-i18n="btn_check_login">检查登录</button>
-<button id="btn-auto" onclick="autoCapture()" style="background:linear-gradient(135deg,#22c55e,#059669)" data-i18n="btn_auto_capture">自动捕获</button>
+<button id="btn-auto" onclick="autoCapture()" style="background:linear-gradient(135deg,#22c55e,#059669)" data-i18n="btn_auto_capture">自动刷新</button>
+<button id="btn-stop-refresh" onclick="toggleAutoRefresh()" style="display:none"></button>
 </div>
 <div id="update-msg" class="msg"></div>
 </div>
 
 <div class="card">
-<h2 data-i18n="title_status">Token 与登录状态</h2>
+<h2 data-i18n="title_status">Token 与 登录状态</h2>
 <div id="status-content"><span style="color:#64748b" data-i18n="loading">加载中...</span></div>
 <div style="border-top:1px solid #334155;margin:.75rem 0"></div>
 <div id="chromium-status"><span style="color:#64748b" data-i18n="loading">加载中...</span></div>
@@ -700,6 +709,10 @@ const i18n={
     login_not_ok:'未登录。请先使用油猴脚本推送 Cookie。',check_failed:'检查失败：',
     capturing_btn:'捕获中...',check_btn:'检查中...',
     status_yes:'是',status_no:'否',
+    auto_refresh_on:'自动刷新：开',auto_refresh_off:'自动刷新：关',
+    btn_stop_refresh:'停止自动刷新',btn_start_refresh:'启动自动刷新',
+    auto_refresh_stopped:'自动刷新已停止',auto_refresh_started:'自动刷新已启动',
+    auto_refresh_label:'自动刷新',
   },
   en:{
     title_update_token:'Update Token',btn_update:'Update Token',btn_check_login:'Check Login',btn_auto_capture:'Auto Capture',
@@ -717,6 +730,10 @@ const i18n={
     login_not_ok:'Not logged in. Use Tampermonkey script to push cookies first.',check_failed:'Check failed: ',
     capturing_btn:'Capturing...',check_btn:'Checking...',
     status_yes:'Yes',status_no:'No',
+    auto_refresh_on:'Auto Refresh: On',auto_refresh_off:'Auto Refresh: Off',
+    btn_stop_refresh:'Stop Auto Refresh',btn_start_refresh:'Start Auto Refresh',
+    auto_refresh_stopped:'Auto refresh stopped',auto_refresh_started:'Auto refresh started',
+    auto_refresh_label:'Auto Refresh',
   }
 };
 let lang=localStorage.getItem('lang')||'zh';
@@ -761,7 +778,9 @@ async function loadStatus(){
       '<div class="status-row"><span class="status-label">'+t('valid')+'</span><span class="status-value '+cls+'">'+(v?t('status_yes'):t('status_no'))+'</span></div>'+
       '<div class="status-row"><span class="status-label">'+t('expires')+'</span><span class="status-value '+(v&&d.seconds_remaining<600?'warn':'')+'">'+exp+'</span></div>'+
       '<div class="status-row"><span class="status-label">'+t('remaining')+'</span><span class="status-value '+(v&&d.seconds_remaining<600?'warn':'')+'">'+fmtSec(d.seconds_remaining)+'</span></div>'+
+      '<div class="status-row"><span class="status-label" data-i18n="auto_refresh_label">自动刷新</span><span class="status-value '+(d.auto_refresh?'valid':'warn')+'">'+(d.auto_refresh?t('status_yes'):t('status_no'))+'</span></div>'+
       (d.error?'<div class="status-row"><span class="status-label">'+t('error')+'</span><span class="status-value invalid">'+d.error+'</span></div>':'');
+    updateRefreshBtn(d.auto_refresh);
   }catch(e){
     document.getElementById('status-content').innerHTML='<span class="invalid">Failed to load</span>';
   }
@@ -790,6 +809,37 @@ function fmtSec(s){
   if(!s&&s!==0)return'N/A';
   const h=Math.floor(s/3600),m=Math.floor(s%3600/60),sec=s%60;
   return(h?h+'h ':'')+(m?m+'m ':'')+sec+'s';
+}
+
+function updateRefreshBtn(enabled){
+  const btn=document.getElementById('btn-stop-refresh');
+  if(enabled){
+    btn.style.display='inline-block';
+    btn.style.background='linear-gradient(135deg,#ef4444,#dc2626)';
+    btn.textContent=t('btn_stop_refresh');
+  }else{
+    btn.style.display='inline-block';
+    btn.style.background='linear-gradient(135deg,#22c55e,#059669)';
+    btn.textContent=t('btn_start_refresh');
+  }
+}
+
+async function toggleAutoRefresh(){
+  const msg=document.getElementById('update-msg');
+  const btn=document.getElementById('btn-stop-refresh');
+  btn.disabled=true;msg.className='msg';msg.textContent='';
+  try{
+    const r=await fetch('/v1/token/auto-refresh-toggle',{method:'POST'});
+    const d=await r.json();
+    if(r.ok){
+      msg.className='msg ok';msg.textContent=d.auto_refresh?t('auto_refresh_started'):t('auto_refresh_stopped');
+      updateRefreshBtn(d.auto_refresh);
+      loadStatus();
+    }else{
+      msg.className='msg err';msg.textContent=d.error?.message||d.error||'Toggle failed';
+    }
+  }catch(e){msg.className='msg err';msg.textContent=(lang==='zh'?'网络错误：':'Network error: ')+e}
+  finally{btn.disabled=false}
 }
 
 async function updateToken(){
