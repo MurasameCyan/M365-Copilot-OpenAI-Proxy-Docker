@@ -26,7 +26,7 @@ def create_app(
     settings: Settings | None = None,
     copilot_client_factory: Callable[[], SubstrateCopilotClient] | None = None,
 ) -> FastAPI:
-    app = FastAPI(title="Microsoft 365 Copilot OpenAI Proxy")
+    app = FastAPI(title="Ciallo Ms-365 OpenAI Proxy")
     resolved_settings = settings or Settings()
     app.state.settings = resolved_settings
     app.state.token_store = AccessTokenStore(resolved_settings.access_token)
@@ -542,7 +542,7 @@ _ADMIN_HTML = """<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>M365 Copilot Proxy Admin</title>
+<title>Ciallo Ms-365 OpenAI Proxy</title>
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
 body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;padding:2rem}
@@ -570,7 +570,7 @@ a:hover{text-decoration:underline}
 </head>
 <body>
 <div class="container">
-<h1>M365 Copilot Proxy <button id="lang-toggle" onclick="toggleLang()" style="font-size:12px;padding:2px 8px;border:1px solid #475569;border-radius:4px;background:#1e293b;color:#94a3b8;cursor:pointer;vertical-align:middle;margin-left:8px">EN</button></h1>
+<h1>Ciallo Ms-365 OpenAI Proxy <button id="lang-toggle" onclick="toggleLang()" style="font-size:12px;padding:2px 8px;border:1px solid #475569;border-radius:4px;background:#1e293b;color:#94a3b8;cursor:pointer;vertical-align:middle;margin-left:8px">EN</button></h1>
 
 <div class="card">
 <h2 data-i18n="title_update_token">更新 Token</h2>

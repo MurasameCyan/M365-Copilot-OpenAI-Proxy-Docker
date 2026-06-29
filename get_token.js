@@ -2,7 +2,7 @@
 // @name         M365 Copilot Token & Cookie Extractor
 // @namespace    https://m365.cloud.microsoft
 // @version      4.0
-// @description  拦截 M365 Copilot Substrate WebSocket 连接，提取 access_token；通过 GM_cookie 获取完整 Cookie（含 httpOnly）推送到代理服务实现 Chromium 登录
+// @description  提取 M365 Copilot 完整 Cookie（含 httpOnly）推送到代理服务实现登录
 // @match        https://m365.cloud.microsoft/*
 // @match        https://login.microsoftonline.com/*
 // @match        https://microsoftonline.com/*
@@ -143,7 +143,7 @@
     // Check if GM_cookie is available
     function hasGMCookie() {
         return (typeof GM_cookie !== 'undefined' && typeof GM_cookie.list === 'function') ||
-               (typeof GM !== 'undefined' && GM.cookie && typeof GM.cookie.list === 'function');
+            (typeof GM !== 'undefined' && GM.cookie && typeof GM.cookie.list === 'function');
     }
 
     // Push Token to proxy
@@ -253,72 +253,84 @@
         }
 
         const gmCookieNote = hasGMCookie()
-            ? '<span style="color:#22c55e">GM_cookie available - httpOnly cookies accessible</span>'
-            : '<span style="color:#f59e0b">GM_cookie not available. Install Tampermonkey Beta or enable httpOnly access in settings.</span>';
+        ? '<span style="color:#22c55e">&#10003; GM_cookie available</span>'
+        : '<span style="color:#f59e0b">&#9888; GM_cookie unavailable. Use Tampermonkey Beta.</span>';
 
         const panel = document.createElement('div');
         panel.id = 'm365-token-panel';
         panel.innerHTML = `
             <div style="position:fixed; top:10px; right:10px; z-index:99999;
-                        background:#1a1a2e; color:#e0e0e0; padding:16px 20px;
-                        border-radius:10px; font-family:monospace; font-size:13px;
-                        box-shadow:0 4px 20px rgba(0,0,0,0.5); max-width:520px;
-                        border:1px solid #16213e; max-height:90vh; overflow-y:auto;">
-                <div style="font-weight:bold; font-size:15px; margin-bottom:8px; color:#00d2ff;">
-                    M365 Copilot Proxy Tool
+                        background:linear-gradient(180deg,#0f172a 0%,#1e293b 100%);
+                        color:#e2e8f0; padding:20px 24px;
+                        border-radius:14px; font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',monospace; font-size:13px;
+                        box-shadow:0 8px 32px rgba(0,0,0,0.6),0 0 0 1px rgba(148,163,184,0.1);
+                        max-width:480px; width:calc(100vw - 20px); max-height:90vh; overflow-y:auto;
+                        backdrop-filter:blur(12px);">
+                <div style="font-weight:700; font-size:16px; margin-bottom:12px; color:#38bdf8;
+                            letter-spacing:0.5px; display:flex; align-items:center; gap:8px;">
+                    <span style="font-size:18px">&#9889;</span> Ciallo Ms-365 Proxy
                 </div>
 
-                <div style="margin-bottom:10px;">
-                    <div style="font-size:11px; color:#8892b0; margin-bottom:4px;">Proxy URL</div>
+                <div style="margin-bottom:12px;">
+                    <div style="font-size:11px; color:#94a3b8; margin-bottom:5px; font-weight:500;">Proxy URL</div>
                     <input id="m365-proxy-url" type="text" placeholder="http://your-server:8000"
                         value="${PROXY_BASE}"
-                        style="width:100%; padding:6px 10px; background:#0f0f23; border:1px solid #475569;
-                               border-radius:6px; color:#e0e0e0; font-size:12px; font-family:monospace;">
+                        style="width:100%; box-sizing:border-box; padding:8px 12px; background:#0f172a; border:1px solid #334155;
+                               border-radius:8px; color:#e2e8f0; font-size:12px; font-family:monospace;
+                               outline:none; transition:border-color 0.2s;"
+                        onfocus="this.style.borderColor='#38bdf8'" onblur="this.style.borderColor='#334155'">
                 </div>
 
-                <div style="font-size:11px; color:#8892b0; margin-bottom:4px;">Token<span style="color:#64748b"> (truncated)</span></div>
-                <div style="word-break:break-all; max-height:60px; overflow-y:auto;
-                            background:#0f0f23; padding:8px; border-radius:6px;
-                            font-size:10px; color:#a8b2d1; line-height:1.4;">
-                    ${latestToken ? latestToken.slice(0, 80) + '...' : 'No token captured yet'}
+                <div style="font-size:11px; color:#94a3b8; margin-bottom:5px; font-weight:500;">Token <span style="color:#475569">truncated</span></div>
+                <div style="word-break:break-all; max-height:56px; overflow-y:auto;
+                            background:#0f172a; padding:8px 12px; border-radius:8px;
+                            font-size:11px; color:#a8b2d1; line-height:1.5;
+                            border:1px solid #334155;">
+                    ${latestToken ? latestToken.slice(0, 80) + '...' : '<span style="color:#475569">No token captured yet</span>'}
                 </div>
 
-                <div style="margin-top:10px; display:flex; flex-wrap:wrap; gap:6px;">
-                    <button id="m365-copy-token" style="padding:5px 12px; border:none;
-                            border-radius:6px; background:#00d2ff; color:#1a1a2e;
-                            cursor:pointer; font-weight:bold; font-size:12px;">
-                        Copy Token
+                <div style="margin-top:12px; display:flex; gap:8px;">
+                    <button id="m365-copy-token" style="flex:1; padding:8px 0; border:none;
+                            border-radius:8px; background:#0ea5e9; color:#fff;
+                            cursor:pointer; font-weight:600; font-size:12px;
+                            transition:opacity 0.2s;" onmouseover="this.style.opacity=0.85" onmouseout="this.style.opacity=1">
+                        &#128203; Copy Token
                     </button>
-                    <button id="m365-push-token" style="padding:5px 12px; border:none;
-                            border-radius:6px; background:#22c55e; color:#fff;
-                            cursor:pointer; font-weight:bold; font-size:12px;">
-                        Push Token
-                    </button>
-                </div>
-
-                <div style="border-top:1px solid #334155; margin:12px 0 10px; padding-top:10px;">
-                    <div style="font-size:11px; color:#8892b0; margin-bottom:6px;">Cookie Login <span style="font-size:10px">${gmCookieNote}</span></div>
-                    <button id="m365-push-cookies" style="padding:5px 12px; border:none;
-                            border-radius:6px; background:#8b5cf6; color:#fff;
-                            cursor:pointer; font-weight:bold; font-size:12px; width:100%;">
-                        Push All Cookies (incl. httpOnly)
+                    <button id="m365-push-token" style="flex:1; padding:8px 0; border:none;
+                            border-radius:8px; background:#22c55e; color:#fff;
+                            cursor:pointer; font-weight:600; font-size:12px;
+                            transition:opacity 0.2s;" onmouseover="this.style.opacity=0.85" onmouseout="this.style.opacity=1">
+                        &#128228; Push Token
                     </button>
                 </div>
 
-                <div style="border-top:1px solid #334155; margin:12px 0 10px; padding-top:10px;">
-                    <div style="font-size:11px; color:#22c55e; margin-bottom:6px; font-weight:bold;">Quick Setup</div>
-                    <div style="font-size:10px; color:#8892b0; margin-bottom:6px;">Push cookies + token to proxy for Chromium login and auto-refresh</div>
-                    <button id="m365-one-click" style="padding:5px 12px; border:none;
-                            border-radius:6px; background:linear-gradient(135deg,#8b5cf6,#06b6d4,#22c55e); color:#fff;
-                            cursor:pointer; font-weight:bold; font-size:12px; width:100%;">
-                        One-Click Setup
+                <div style="border-top:1px solid #1e293b; margin:14px 0 12px; padding-top:12px;">
+                    <div style="font-size:11px; color:#94a3b8; margin-bottom:8px; font-weight:500;">Cookie Login ${gmCookieNote}</div>
+                    <button id="m365-push-cookies" style="width:100%; padding:8px 0; border:none;
+                            border-radius:8px; background:linear-gradient(135deg,#8b5cf6,#7c3aed); color:#fff;
+                            cursor:pointer; font-weight:600; font-size:12px;
+                            transition:opacity 0.2s;" onmouseover="this.style.opacity=0.85" onmouseout="this.style.opacity=1">
+                        &#127850; Push All Cookies
                     </button>
                 </div>
 
-                <div style="border-top:1px solid #334155; margin:12px 0 0; padding-top:10px;">
-                    <button id="m365-close-panel" style="padding:5px 12px; border:none;
-                            border-radius:6px; background:#e94560; color:#fff;
-                            cursor:pointer; font-weight:bold; font-size:12px;">
+                <div style="border-top:1px solid #1e293b; margin:0 0 12px; padding-top:12px;">
+                    <div style="font-size:11px; color:#22c55e; margin-bottom:8px; font-weight:700;">&#9889; Quick Setup</div>
+                    <div style="font-size:10px; color:#64748b; margin-bottom:8px;">Push cookies + token to proxy for Chromium login and auto-refresh</div>
+                    <button id="m365-one-click" style="width:100%; padding:10px 0; border:none;
+                            border-radius:8px; background:linear-gradient(135deg,#8b5cf6,#06b6d4,#22c55e); color:#fff;
+                            cursor:pointer; font-weight:700; font-size:13px; letter-spacing:0.3px;
+                            transition:opacity 0.2s;" onmouseover="this.style.opacity=0.85" onmouseout="this.style.opacity=1">
+                        &#128640; One-Click Setup
+                    </button>
+                </div>
+
+                <div style="border-top:1px solid #1e293b; margin:0; padding-top:12px; display:flex; justify-content:space-between; align-items:center;">
+                    <span style="font-size:10px; color:#475569">Ctrl+Shift+M to toggle</span>
+                    <button id="m365-close-panel" style="padding:6px 16px; border:1px solid #334155;
+                            border-radius:8px; background:transparent; color:#94a3b8;
+                            cursor:pointer; font-weight:500; font-size:12px;
+                            transition:all 0.2s;" onmouseover="this.style.borderColor=#ef4444;this.style.color=#ef4444" onmouseout="this.style.borderColor=#334155;this.style.color=#94a3b8">
                         Close
                     </button>
                 </div>

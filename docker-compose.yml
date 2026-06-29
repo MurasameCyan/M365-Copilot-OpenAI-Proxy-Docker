@@ -1,7 +1,7 @@
 services:
-  copilot-proxy:
-    image: ghcr.io/murasamecyan/m365-copilot-openai-proxy:latest
-    container_name: m365-copilot-proxy
+  ciallo-proxy:
+    image: ghcr.io/murasamecyan/ciallo-ms365-openai-proxy:latest
+    container_name: ciallo-ms365-proxy
     ports:
       - "8000:8000"
     env_file:

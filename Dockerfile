@@ -32,7 +32,7 @@ VOLUME /chrome-profile
 
 # Environment variables
 ENV M365_ACCESS_TOKEN=""
-ENV M365_TIME_ZONE="Asia/Tokyo"
+ENV M365_TIME_ZONE="Asia/Shanghai"
 ENV M365_MODEL_ALIAS="m365-copilot"
 ENV CHROME_CDP_PORT=9222
 ENV AUTO_REFRESH="true"
