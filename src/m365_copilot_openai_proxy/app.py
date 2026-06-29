@@ -51,7 +51,7 @@ def create_app(
             return await call_next(request)
         # Skip auth for admin page and health endpoints
         path = request.url.path
-        if path in ("/", "/healthz", "/v1/token/status", "/v1/token/update"):
+        if path in ("/", "/healthz", "/v1/token/status", "/v1/token/update", "/v1/token/auto-capture", "/v1/cookie/inject"):
             return await call_next(request)
         auth = request.headers.get("Authorization", "")
         match = re.match(r"^Bearer\s+(.+)$", auth, re.IGNORECASE)
@@ -104,6 +104,90 @@ def create_app(
         app.state.token_store._token = token
         app.state.token_store._mtime_ns = None
         return {"status": "ok", "message": "Token updated", "token_status": app.state.token_store.status()}
+
+    @app.post("/v1/token/auto-capture")
+    async def auto_capture_token() -> dict:
+        """Auto-capture token from Chromium CDP running inside the container."""
+        import asyncio
+        from .cli import _cdp_extract_token, _write_token
+        cdp_port = int(resolved_settings.api_key or "9222")  # not api_key, get from env
+        cdp_port = 9222  # always use default CDP port inside container
+        try:
+            token = await _cdp_extract_token(cdp_port, allow_nudge=True)
+        except Exception as exc:
+            return JSONResponse(status_code=502, content={"error": f"CDP capture failed: {exc}"})
+        if not token:
+            return JSONResponse(status_code=404, content={"error": "No substrate token found. Make sure M365 Copilot is open and logged in in Chromium."})
+        # Write to .env and update in-memory
+        _write_token(token)
+        app.state.token_store._token = token
+        app.state.token_store._mtime_ns = None
+        return {"status": "ok", "message": "Token auto-captured", "token_status": app.state.token_store.status()}
+
+    @app.post("/v1/cookie/inject")
+    async def inject_cookie(request: Request) -> dict:
+        """Inject cookies into Chromium via CDP to log in to M365."""
+        body = await request.json()
+        cookies = body.get("cookies", [])
+        if not cookies:
+            return JSONResponse(status_code=400, content={"error": "No cookies provided"})
+        import asyncio as _async
+        import httpx as _httpx
+        import websockets as _ws
+
+        cdp_port = 9222
+        try:
+            async with _httpx.AsyncClient(timeout=3) as client:
+                tabs = (await client.get(f"http://localhost:{cdp_port}/json")).json()
+        except Exception as exc:
+            return JSONResponse(status_code=502, content={"error": f"Cannot connect to Chromium CDP: {exc}"})
+
+        tab = next((t for t in tabs if t.get("type") == "page" and t.get("url", "").startswith("https://m365.cloud.microsoft/")), None)
+        if not tab:
+            tab = next((t for t in tabs if t.get("type") == "page"), None)
+        if not tab:
+            return JSONResponse(status_code=404, content={"error": "No browser tab found in Chromium"})
+
+        injected = 0
+        try:
+            async with _ws.connect(tab["webSocketDebuggerUrl"]) as ws:
+                if "m365.cloud.microsoft" not in tab.get("url", ""):
+                    await ws.send(json.dumps({"id": 1, "method": "Page.navigate", "params": {"url": "https://m365.cloud.microsoft/chat"}}))
+                    await _async.sleep(3)
+                    try:
+                        await _async.wait_for(ws.recv(), timeout=2)
+                    except (_async.TimeoutError, Exception):
+                        pass
+
+                for i, cookie in enumerate(cookies):
+                    cookie_params = {
+                        "name": cookie.get("name", ""),
+                        "value": cookie.get("value", ""),
+                        "domain": cookie.get("domain", ".microsoft.com"),
+                        "path": cookie.get("path", "/"),
+                        "secure": cookie.get("secure", True),
+                        "httpOnly": cookie.get("httpOnly", False),
+                    }
+                    if cookie.get("sameSite"):
+                        ss = cookie["sameSite"].capitalize()
+                        if ss in ("Strict", "Lax", "None"):
+                            cookie_params["sameSite"] = ss
+                    if cookie.get("expirationDate"):
+                        cookie_params["expires"] = cookie["expirationDate"]
+                    await ws.send(json.dumps({"id": 100 + i, "method": "Network.setCookie", "params": cookie_params}))
+                    try:
+                        resp = await _async.wait_for(ws.recv(), timeout=5)
+                        result = json.loads(resp)
+                        if result.get("result", {}).get("success"):
+                            injected += 1
+                    except (_async.TimeoutError, Exception):
+                        pass
+
+                await ws.send(json.dumps({"id": 999, "method": "Page.reload"}))
+        except Exception as exc:
+            return JSONResponse(status_code=502, content={"error": f"CDP cookie injection failed: {exc}"})
+
+        return {"status": "ok", "message": f"Injected {injected}/{len(cookies)} cookies. Page reloading.", "injected": injected, "total": len(cookies)}
 
     @app.get("/", response_class=HTMLResponse)
     async def admin_page() -> str:
@@ -396,7 +480,10 @@ a:hover{text-decoration:underline}
 <h2>Update Token</h2>
 <p style="color:#64748b;font-size:.85rem;margin-bottom:.75rem">Paste the access_token value or the full wss:// URL from <a href="https://m365.cloud.microsoft/chat" target="_blank">M365 Copilot</a></p>
 <textarea id="token-input" placeholder="eyJ0eXAiOiJKV1QiLCJhbGci...&#10;&#10;or full URL:&#10;wss://substrate.office.com/m365Copilot/Chathub/...?access_token=eyJ..."></textarea>
+<div style="display:flex;gap:.75rem;margin-bottom:.25rem">
 <button id="btn-update" onclick="updateToken()">Update Token</button>
+<button id="btn-auto" onclick="autoCapture()" style="background:linear-gradient(135deg,#22c55e,#059669)">Auto Capture</button>
+</div>
 <div id="update-msg" class="msg"></div>
 </div>
 
@@ -406,11 +493,24 @@ a:hover{text-decoration:underline}
 GET  /healthz<br>
 GET  /v1/token/status<br>
 POST /v1/token/update<br>
+POST /v1/token/auto-capture<br>
+POST /v1/cookie/inject<br>
 GET  /v1/models<br>
 POST /v1/chat/completions<br>
 POST /v1/responses<br>
 POST /v1/messages
 </div>
+</div>
+
+<div class="card">
+<h2>Cookie Login</h2>
+<p style="color:#64748b;font-size:.85rem;margin-bottom:.75rem">Inject M365 cookies into Chromium to log in. <a href="https://m365.cloud.microsoft/chat" target="_blank">Open M365 Copilot</a> in your browser first.</p>
+<div style="display:flex;gap:.75rem;margin-bottom:.75rem">
+<button id="btn-export" onclick="copyCookieScript()" style="background:linear-gradient(135deg,#f59e0b,#d97706);font-size:.8rem;padding:.5rem 1rem">1. Copy Cookie Script</button>
+<button id="btn-inject" onclick="injectCookies()" style="background:linear-gradient(135deg,#8b5cf6,#6d28d9);font-size:.8rem;padding:.5rem 1rem">2. Inject Cookies</button>
+</div>
+<textarea id="cookie-input" placeholder="Paste cookies JSON here, e.g.:&#10;{&#10;  "cookies": [&#10;    {"name": "...", "value": "...", "domain": ".microsoft.com"},&#10;    ...&#10;  ]&#10;}" style="height:100px"></textarea>
+<div id="cookie-msg" class="msg"></div>
 </div>
 </div>
 
@@ -456,6 +556,49 @@ async function updateToken(){
     }
   }catch(e){msg.className='msg err';msg.textContent='Network error: '+e}
   finally{btn.disabled=false}
+}
+
+async function autoCapture(){
+  const msg=document.getElementById('update-msg');
+  const btn=document.getElementById('btn-auto');
+  const upd=document.getElementById('btn-update');
+  btn.disabled=true;upd.disabled=true;
+  msg.className='msg';msg.textContent='';
+  btn.textContent='Capturing...';
+  try{
+    const r=await fetch('/v1/token/auto-capture',{method:'POST'});
+    const d=await r.json();
+    if(r.ok){
+      msg.className='msg ok';msg.textContent='Auto-captured! Remaining: '+fmtSec(d.token_status?.seconds_remaining);
+      loadStatus();
+    }else{
+      msg.className='msg err';msg.textContent=d.error||'Auto-capture failed';
+    }
+  }catch(e){msg.className='msg err';msg.textContent='Network error: '+e}
+  finally{btn.disabled=false;upd.disabled=false;btn.textContent='Auto Capture'}
+}
+
+function copyCookieScript(){
+  const script=`(function(){const c=document.cookie.split(';').map(x=>{const[n,...v]=x.trim().split('=');return{name:n,value:v.join('='),domain:location.hostname,path:'/',secure:location.protocol==='https:',httpOnly:false,sameSite:'Lax'}});const d=JSON.stringify({cookies:c});navigator.clipboard.writeText(d).then(()=>alert('Cookies copied! Go back to Admin page and paste into Cookie input.')).catch(()=>{const t=document.createElement('textarea');t.value=d;document.body.appendChild(t);t.select();document.execCommand('copy');document.body.removeChild(t);alert('Cookies copied!');})})()`;
+  navigator.clipboard.writeText(script).then(()=>{document.getElementById('cookie-msg').className='msg ok';document.getElementById('cookie-msg').textContent='Script copied! Now: 1) Open M365 Copilot, 2) Press F12 -> Console, 3) Paste & run the script, 4) Come back and paste result into Cookie input.'}).catch(()=>{document.getElementById('cookie-msg').className='msg err';document.getElementById('cookie-msg').textContent='Copy failed. Please copy manually.'});
+}
+
+async function injectCookies(){
+  const msg=document.getElementById('cookie-msg');
+  const btn=document.getElementById('btn-inject');
+  const input=document.getElementById('cookie-input').value.trim();
+  if(!input){msg.className='msg err';msg.textContent='Please paste cookies JSON first';return}
+  let data;
+  try{data=JSON.parse(input)}catch(e){msg.className='msg err';msg.textContent='Invalid JSON format';return}
+  if(!data.cookies||!Array.isArray(data.cookies)){msg.className='msg err';msg.textContent='JSON must have a "cookies" array';return}
+  btn.disabled=true;btn.textContent='Injecting...';msg.className='msg';msg.textContent='';
+  try{
+    const r=await fetch('/v1/cookie/inject',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(data)});
+    const d=await r.json();
+    if(r.ok){msg.className='msg ok';msg.textContent=d.message}
+    else{msg.className='msg err';msg.textContent=d.error||'Injection failed'}
+  }catch(e){msg.className='msg err';msg.textContent='Network error: '+e}
+  finally{btn.disabled=false;btn.textContent='2. Inject Cookies'}
 }
 
 loadStatus();
