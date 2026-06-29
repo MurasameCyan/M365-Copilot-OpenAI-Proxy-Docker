@@ -585,12 +585,9 @@ a:hover{text-decoration:underline}
 </div>
 
 <div class="card">
-<h2>Token Status</h2>
+<h2>Token & Login Status</h2>
 <div id="status-content"><span style="color:#64748b">Loading...</span></div>
-</div>
-
-<div class="card">
-<h2>Chromium Status</h2>
+<div style="border-top:1px solid #334155;margin:.75rem 0"></div>
 <div id="chromium-status"><span style="color:#64748b">Loading...</span></div>
 </div>
 
@@ -643,15 +640,9 @@ async function loadChromiumStatus(){
     }
     const logCls=d.logged_in?'valid':('warn');
     const logText=d.logged_in?'Logged In':'Not Logged In (auto-refresh only)';
-    let html='<div class="status-row"><span class="status-label">Chromium</span><span class="status-value valid">Running</span></div>';
-    html+='<div class="status-row"><span class="status-label">Login</span><span class="status-value '+logCls+'">'+logText+'</span></div>';
+    let html='<div class="status-row"><span class="status-label">Login</span><span class="status-value '+logCls+'">'+logText+'</span></div>';
     if(d.url)html+='<div class="status-row"><span class="status-label">Page</span><span class="status-value" style="font-size:.75rem;word-break:break-all">'+d.url+'</span></div>';
     if(d.title)html+='<div class="status-row"><span class="status-label">Title</span><span class="status-value" style="font-size:.75rem">'+d.title+'</span></div>';
-    if(d.cookies&&d.cookies.length){
-      html+='<div class="status-row"><span class="status-label">Cookies</span><span class="status-value" style="font-size:.7rem;word-break:break-all">'+d.cookies.map(c=>c.name+(c.httpOnly?'*':'')+'@'+c.domain).join(', ')+'</span></div>';
-    }else{
-      html+='<div class="status-row"><span class="status-label">Cookies</span><span class="status-value" style="font-size:.75rem;color:#64748b">None found</span></div>';
-    }
     document.getElementById('chromium-status').innerHTML=html;
   }catch(e){
     document.getElementById('chromium-status').innerHTML='<span class="invalid">Failed to load</span>';
