@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import time
@@ -9,7 +10,7 @@ from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse, Response
 
 from .config import Settings
 from .session_store import PersistentSession, PersistentSessionStore
@@ -34,6 +35,17 @@ def create_app(
     app.state.copilot_client_factory = copilot_client_factory or (
         lambda: SubstrateCopilotClient(app.state.token_store.get(), resolved_settings.time_zone)
     )
+
+    def _admin_cookie_hash() -> str:
+        """Hash of API_KEY used as admin session token."""
+        return hashlib.sha256(("admin:" + resolved_settings.api_key).encode()).hexdigest()[:32]
+
+    def _is_admin_authenticated(request: Request) -> bool:
+        """Check if the request has a valid admin auth cookie."""
+        if not resolved_settings.api_key:
+            return True
+        cookie_val = request.cookies.get("admin_auth", "")
+        return cookie_val == _admin_cookie_hash()
 
     # CORS middleware
     app.add_middleware(
@@ -61,7 +73,7 @@ def create_app(
             return await call_next(request)
         # Skip auth for admin page and health endpoints
         path = request.url.path
-        if path in ("/", "/favicon.ico", "/healthz", "/v1/token/status", "/v1/token/update", "/v1/token/auto-capture", "/v1/cookie/inject", "/v1/chromium/login-status"):
+        if path in ("/favicon.ico", "/healthz", "/v1/token/status", "/v1/token/update", "/v1/token/auto-capture", "/v1/cookie/inject", "/v1/chromium/login-status", "/admin/login"):
             return await call_next(request)
         auth = request.headers.get("Authorization", "")
         match = re.match(r"^Bearer\s+(.+)$", auth, re.IGNORECASE)
@@ -285,8 +297,20 @@ def create_app(
             "cookies": cookie_details,
         }
 
+    @app.post("/admin/login")
+    async def admin_login(request: Request) -> Response:
+        body = await request.json()
+        password = body.get("password", "")
+        if password == resolved_settings.api_key:
+            resp = JSONResponse({"status": "ok"})
+            resp.set_cookie("admin_auth", _admin_cookie_hash(), max_age=86400 * 7, httponly=True, samesite="lax")
+            return resp
+        return JSONResponse({"error": {"message": "Wrong password", "type": "auth_error"}}, status_code=401)
+
     @app.get("/", response_class=HTMLResponse)
-    async def admin_page() -> str:
+    async def admin_page(request: Request) -> str:
+        if resolved_settings.api_key and not _is_admin_authenticated(request):
+            return _LOGIN_HTML
         return _ADMIN_HTML
 
     @app.get("/favicon.ico")
@@ -536,6 +560,52 @@ async def _anthropic_stream(
     yield sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": 0}})
     yield sse("message_stop", {"type": "message_stop"})
 
+
+_LOGIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ciallo Ms-365 OpenAI Proxy</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;display:flex;align-items:center;justify-content:center}
+.login-box{background:#1e293b;border-radius:14px;padding:2.5rem;width:360px;border:1px solid #334155;text-align:center}
+.login-box h1{font-size:1.3rem;margin-bottom:.5rem;background:linear-gradient(135deg,#06b6d4,#8b5cf6);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.login-box p{color:#64748b;font-size:.85rem;margin-bottom:1.5rem}
+input{width:100%;padding:.75rem 1rem;background:#0f172a;border:1px solid #475569;border-radius:8px;color:#e2e8f0;font-size:.9rem;outline:none;margin-bottom:1rem;transition:border-color .2s}
+input:focus{border-color:#06b6d4}
+button{width:100%;background:linear-gradient(135deg,#06b6d4,#8b5cf6);color:#fff;border:none;border-radius:8px;padding:.75rem;font-size:.95rem;font-weight:600;cursor:pointer;transition:opacity .2s}
+button:hover{opacity:.85}
+button:disabled{opacity:.5;cursor:not-allowed}
+.msg{padding:.5rem .75rem;border-radius:6px;font-size:.8rem;margin-top:.75rem;display:none}
+.msg.err{display:block;background:#450a0a;color:#ef4444;border:1px solid #991b1b}
+</style>
+</head>
+<body>
+<div class="login-box">
+<h1>Ciallo Ms-365 OpenAI Proxy</h1>
+<p>Enter admin password to continue</p>
+<input id="pw" type="password" placeholder="API Key / Password" autofocus onkeydown="if(event.key==='Enter')doLogin()">
+<button id="btn" onclick="doLogin()">Login</button>
+<div id="msg" class="msg"></div>
+</div>
+<script>
+async function doLogin(){
+  const pw=document.getElementById('pw').value;
+  const btn=document.getElementById('btn');
+  const msg=document.getElementById('msg');
+  btn.disabled=true;msg.className='msg';msg.textContent='';
+  try{
+    const r=await fetch('/admin/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+    const d=await r.json();
+    if(r.ok){location.reload()}else{msg.className='msg err';msg.textContent=d.error?.message||'Login failed'}
+  }catch(e){msg.className='msg err';msg.textContent='Network error'}
+  finally{btn.disabled=false}
+}
+</script>
+</body>
+</html>"""
 
 _ADMIN_HTML = """<!DOCTYPE html>
 <html lang="en">

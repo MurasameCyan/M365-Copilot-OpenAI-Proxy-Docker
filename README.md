@@ -1,4 +1,4 @@
-# Ciallo Ms-365 OpenAI Proxy (Docker)
+# Ciallo Ms-365 OpenAI Proxy Docker
 
 将 Microsoft 365 Copilot 暴露为 OpenAI 兼容 API 的 Docker 代理服务。
 
