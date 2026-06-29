@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         M365 Copilot Token & Cookie Extractor
 // @namespace    https://m365.cloud.microsoft
-// @version      2.0
-// @description  拦截 M365 Copilot Substrate WebSocket 连接，提取 access_token 和 Cookie
+// @version      3.1
+// @description  拦截 M365 Copilot Substrate WebSocket 连接，提取 access_token 并推送到代理服务
 // @match        https://m365.cloud.microsoft/*
 // @grant        none
 // ==/UserScript==
@@ -13,13 +13,16 @@
     const SUBSTRATE_WS_RE = /wss:\/\/substrate\.office\.com\/.*[?&]access_token=([^&]+)/;
     const PROXY_BASE = ''; // 留空则从面板输入框读取，或填入你的代理地址如 http://192.168.1.100:8000
 
-    // 拦截 WebSocket 构造
+    // Store the latest token
+    let latestToken = '';
+
+    // Intercept WebSocket construction
     const OrigWebSocket = window.WebSocket;
     window.WebSocket = function(url, protocols) {
         const match = url.match(SUBSTRATE_WS_RE);
         if (match) {
-            const token = match[1];
-            showTokenPanel(token);
+            latestToken = match[1];
+            showPanel();
         }
         return new OrigWebSocket(url, protocols);
     };
@@ -29,7 +32,8 @@
     window.WebSocket.CLOSING = OrigWebSocket.CLOSING;
     window.WebSocket.CLOSED = OrigWebSocket.CLOSED;
 
-    function getCookies() {
+    // Get cookies that document.cookie can see (non-httpOnly only)
+    function getVisibleCookies() {
         return document.cookie.split(';').map(c => {
             const [name, ...rest] = c.trim().split('=');
             return {
@@ -37,9 +41,9 @@
                 value: rest.join('='),
                 domain: location.hostname,
                 path: '/',
-                secure: location.protocol === 'https:',
+                secure: true,
                 httpOnly: false,
-                sameSite: 'Lax'
+                sameSite: 'None'
             };
         });
     }
@@ -49,26 +53,28 @@
         return input ? input.value.trim().replace(/\/+$/, '') : PROXY_BASE;
     }
 
-    // 推送 Token 到代理
-    async function pushToken(token) {
+    // Push Token to proxy
+    async function pushToken() {
         const base = getProxyBase();
         if (!base) { alert('Please enter proxy URL first'); return; }
+        if (!latestToken) { alert('No token captured yet. Type something in Copilot to trigger WebSocket.'); return; }
         try {
             const r = await fetch(base + '/v1/token/update', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ token })
+                body: JSON.stringify({ token: latestToken })
             });
             const d = await r.json();
-            alert(r.ok ? `Token pushed! Remaining: ${d.token_status?.seconds_remaining}s` : `Failed: ${d.error}`);
-        } catch (e) { alert('Network error: ' + e); }
+            alert(r.ok ? `Token pushed! Remaining: ${d.token_status?.seconds_remaining}s` : `Failed: ${d.error?.message || d.error}`);
+        } catch (e) { alert('Network error: ' + e + '\n\nMake sure the proxy server has CORS enabled and is reachable.'); }
     }
 
-    // 推送 Cookie 到代理
+    // Push visible cookies to proxy (press button in panel)
     async function pushCookies() {
         const base = getProxyBase();
         if (!base) { alert('Please enter proxy URL first'); return; }
-        const cookies = getCookies();
+        const cookies = getVisibleCookies();
+        if (!cookies.length) { alert('No cookies found on this page.'); return; }
         try {
             const r = await fetch(base + '/v1/cookie/inject', {
                 method: 'POST',
@@ -76,18 +82,64 @@
                 body: JSON.stringify({ cookies })
             });
             const d = await r.json();
-            alert(r.ok ? `Cookies pushed! ${d.message}` : `Failed: ${d.error}`);
+            alert(r.ok ? `Cookies pushed! ${d.message}` : `Failed: ${d.error?.message || d.error}`);
         } catch (e) { alert('Network error: ' + e); }
     }
 
-    // 复制 Cookie JSON
+    // Copy visible cookies JSON
     function copyCookies() {
-        const cookies = getCookies();
+        const cookies = getVisibleCookies();
         const data = JSON.stringify({ cookies }, null, 2);
-        navigator.clipboard.writeText(data).then(() => alert('Cookies JSON copied!')).catch(() => alert('Copy failed'));
+        navigator.clipboard.writeText(data).then(() => alert('Cookies JSON copied! (httpOnly cookies not included - use browser extension for those)')).catch(() => alert('Copy failed'));
     }
 
-    function showTokenPanel(token) {
+    // Copy token to clipboard
+    function copyToken() {
+        if (!latestToken) { alert('No token captured yet'); return; }
+        navigator.clipboard.writeText(latestToken).then(() => alert('Token copied!')).catch(() => alert('Copy failed'));
+    }
+
+    // One-click: push token then auto-capture (no cookie push - httpOnly cookies not accessible via document.cookie)
+    async function oneClickSetup() {
+        const base = getProxyBase();
+        if (!base) { alert('Please enter proxy URL first'); return; }
+        if (!latestToken) { alert('No token captured yet. Type something in Copilot to trigger WebSocket first.'); return; }
+
+        const btn = document.getElementById('m365-one-click');
+        btn.textContent = 'Working...';
+        btn.disabled = true;
+
+        try {
+            // Step 1: Push token
+            btn.textContent = 'Pushing token...';
+            const tr = await fetch(base + '/v1/token/update', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ token: latestToken })
+            });
+            const td = await tr.json();
+            if (!tr.ok) { alert('Token push failed: ' + (td.error?.message || td.error)); return; }
+
+            // Step 2: Auto-capture (optional, to sync Chromium state)
+            btn.textContent = 'Auto-capturing...';
+            await new Promise(r => setTimeout(r, 2000));
+            const cr = await fetch(base + '/v1/token/auto-capture', { method: 'POST' });
+            const cd = await cr.json();
+
+            if (cr.ok) {
+                alert(`Setup complete! Token remaining: ${cd.token_status?.seconds_remaining}s`);
+            } else {
+                alert(`Token pushed OK (${td.token_status?.seconds_remaining}s remaining). Auto-capture skipped: ${cd.error?.message || cd.error}`);
+            }
+        } catch (e) {
+            alert('Error: ' + e);
+        } finally {
+            btn.textContent = 'One-Click Setup';
+            btn.disabled = false;
+        }
+    }
+
+    function showPanel() {
         if (document.getElementById('m365-token-panel')) {
             document.getElementById('m365-token-panel').remove();
         }
@@ -112,11 +164,11 @@
                                border-radius:6px; color:#e0e0e0; font-size:12px; font-family:monospace;">
                 </div>
 
-                <div style="font-size:11px; color:#8892b0; margin-bottom:4px;">Token</div>
-                <div style="word-break:break-all; max-height:80px; overflow-y:auto;
+                <div style="font-size:11px; color:#8892b0; margin-bottom:4px;">Token<span style="color:#64748b"> (truncated)</span></div>
+                <div style="word-break:break-all; max-height:60px; overflow-y:auto;
                             background:#0f0f23; padding:8px; border-radius:6px;
                             font-size:10px; color:#a8b2d1; line-height:1.4;">
-                    ${token.slice(0, 80)}...
+                    ${latestToken ? latestToken.slice(0, 80) + '...' : 'No token captured yet'}
                 </div>
 
                 <div style="margin-top:10px; display:flex; flex-wrap:wrap; gap:6px;">
@@ -128,12 +180,12 @@
                     <button id="m365-push-token" style="padding:5px 12px; border:none;
                             border-radius:6px; background:#22c55e; color:#fff;
                             cursor:pointer; font-weight:bold; font-size:12px;">
-                        Push Token to Proxy
+                        Push Token
                     </button>
                 </div>
 
                 <div style="border-top:1px solid #334155; margin:12px 0 10px; padding-top:10px;">
-                    <div style="font-size:11px; color:#8892b0; margin-bottom:6px;">Cookie Tools</div>
+                    <div style="font-size:11px; color:#8892b0; margin-bottom:6px;">Cookie Tools <span style="color:#f59e0b">NOTE: httpOnly cookies not accessible via document.cookie</span></div>
                     <div style="display:flex; flex-wrap:wrap; gap:6px;">
                         <button id="m365-copy-cookies" style="padding:5px 12px; border:none;
                                 border-radius:6px; background:#f59e0b; color:#1a1a2e;
@@ -143,30 +195,44 @@
                         <button id="m365-push-cookies" style="padding:5px 12px; border:none;
                                 border-radius:6px; background:#8b5cf6; color:#fff;
                                 cursor:pointer; font-weight:bold; font-size:12px;">
-                            Push Cookies to Proxy
-                        </button>
-                        <button id="m365-close-panel" style="padding:5px 12px; border:none;
-                                border-radius:6px; background:#e94560; color:#fff;
-                                cursor:pointer; font-weight:bold; font-size:12px;">
-                            Close
+                            Push Cookies
                         </button>
                     </div>
+                </div>
+
+                <div style="border-top:1px solid #334155; margin:12px 0 10px; padding-top:10px;">
+                    <div style="font-size:11px; color:#22c55e; margin-bottom:6px; font-weight:bold;">Quick Setup</div>
+                    <div style="font-size:10px; color:#8892b0; margin-bottom:6px;">Push captured token to proxy then auto-capture</div>
+                    <button id="m365-one-click" style="padding:5px 12px; border:none;
+                            border-radius:6px; background:linear-gradient(135deg,#06b6d4,#22c55e); color:#fff;
+                            cursor:pointer; font-weight:bold; font-size:12px; width:100%;">
+                        One-Click Setup
+                    </button>
+                </div>
+
+                <div style="border-top:1px solid #334155; margin:12px 0 0; padding-top:10px;">
+                    <button id="m365-close-panel" style="padding:5px 12px; border:none;
+                            border-radius:6px; background:#e94560; color:#fff;
+                            cursor:pointer; font-weight:bold; font-size:12px;">
+                        Close
+                    </button>
                 </div>
             </div>
         `;
         document.body.appendChild(panel);
 
-        document.getElementById('m365-copy-token').onclick = () => {
-            navigator.clipboard.writeText(token).then(() => {
-                const btn = document.getElementById('m365-copy-token');
-                btn.textContent = 'Copied!';
-                setTimeout(() => { btn.textContent = 'Copy Token'; }, 1500);
-            });
-        };
-
-        document.getElementById('m365-push-token').onclick = () => pushToken(token);
+        document.getElementById('m365-copy-token').onclick = () => copyToken();
+        document.getElementById('m365-push-token').onclick = () => pushToken();
         document.getElementById('m365-copy-cookies').onclick = () => copyCookies();
         document.getElementById('m365-push-cookies').onclick = () => pushCookies();
+        document.getElementById('m365-one-click').onclick = () => oneClickSetup();
         document.getElementById('m365-close-panel').onclick = () => panel.remove();
     }
+
+    // Show panel on demand via keyboard shortcut (Ctrl+Shift+M)
+    document.addEventListener('keydown', (e) => {
+        if (e.ctrlKey && e.shiftKey && e.key === 'M') {
+            showPanel();
+        }
+    });
 })();
