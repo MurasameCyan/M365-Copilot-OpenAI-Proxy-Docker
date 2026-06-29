@@ -3,10 +3,11 @@
 将 Microsoft 365 Copilot 暴露为 OpenAI 兼容 API 的 Docker 代理服务。
 
 基于 [m365-copilot-openai-proxy](https://github.com/nicolai-anyhoa/m365-copilot-openai-proxy) 项目，封装为 Docker 镜像，支持：
-
 - Chromium headless 自动刷新 Token
 - 多架构镜像 (amd64 + arm64)
 - GitHub Actions 自动构建发布到 GHCR
+- API Key 认证保护
+- CORS 跨域支持
 
 ## API 端点
 
@@ -57,6 +58,7 @@ docker compose logs -f
 | `M365_ACCESS_TOKEN`      | 否*  | —               | Substrate Token，留空则由 Chromium 自动捕获 |
 | `M365_TIME_ZONE`         | 否   | `Asia/Tokyo`   | 发送给 Copilot 的时区                       |
 | `M365_MODEL_ALIAS`       | 否   | `m365-copilot` | 模型名称                                    |
+| `API_KEY`                | 否   | —               | API Key 认证密钥，留空则不启用认证          |
 | `AUTO_REFRESH`           | 否   | `true`         | 是否自动刷新 Token                          |
 | `REFRESH_BEFORE_SECONDS` | 否   | `300`          | Token 过期前多少秒开始刷新                  |
 | `CHROME_CDP_PORT`        | 否   | `9222`         | Chromium CDP 端口                           |
@@ -66,7 +68,7 @@ docker compose logs -f
 | 设置             | 值                             |
 | ---------------- | ------------------------------ |
 | Base URL         | `http://your-server:8000/v1` |
-| API Key          | `dummy`                      |
+| API Key          | 你设置的 `API_KEY` 值（如未设置则填 `dummy`） |
 | Model            | `m365-copilot`               |
 | Persistent model | `m365-copilot:persist`       |
 
@@ -74,7 +76,7 @@ docker compose logs -f
 
 ```bash
 export ANTHROPIC_BASE_URL=http://your-server:8000
-export ANTHROPIC_API_KEY=dummy
+export ANTHROPIC_API_KEY=your-api-key   # 如未设置 API_KEY 则填 dummy
 claude
 ```
 
@@ -82,8 +84,19 @@ claude
 
 ```
 Base URL: http://your-server:8000/v1
-API Key: dummy
+API Key: your-api-key    # 如未设置 API_KEY 则填 dummy
 Model: m365-copilot
+```
+
+## API Key 认证
+
+在 `.env` 中设置 `API_KEY=your-secret-key` 即可启用认证。所有请求需携带 `Authorization: Bearer your-secret-key` 头。
+
+留空 `API_KEY=` 则不启用认证，任何人都可以直接使用。
+
+```bash
+# 带认证的请求示例
+curl -H "Authorization: Bearer your-secret-key" http://localhost:8000/v1/models
 ```
 
 ## 持久会话
