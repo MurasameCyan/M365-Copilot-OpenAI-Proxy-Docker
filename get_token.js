@@ -152,7 +152,7 @@
         if (!base) { alert('Please enter proxy URL first'); return; }
         if (!latestToken) { alert('No token captured yet. Type something in Copilot to trigger WebSocket.'); return; }
         try {
-            const r = await gmFetch(base + '/v1/token/update', {
+            const r = await gmFetch(base + '/admin/token/update', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ token: latestToken })
@@ -180,7 +180,7 @@
             if (!cookies.length) { alert('No cookies found.'); return; }
 
             if (btn) btn.textContent = 'Pushing...';
-            const r = await gmFetch(base + '/v1/cookie/inject', {
+            const r = await gmFetch(base + '/admin/cookie/inject', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ cookies })
@@ -216,7 +216,7 @@
                 btn.textContent = '1/2 Pushing cookies...';
                 const cookies = await getAllCookies();
                 if (cookies.length) {
-                    await gmFetch(base + '/v1/cookie/inject', {
+                    await gmFetch(base + '/admin/cookie/inject', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
                         body: JSON.stringify({ cookies })
@@ -228,7 +228,7 @@
 
             // Step 2: Push token
             btn.textContent = '2/2 Pushing token...';
-            const r = await gmFetch(base + '/v1/token/update', {
+            const r = await gmFetch(base + '/admin/token/update', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ token: latestToken })

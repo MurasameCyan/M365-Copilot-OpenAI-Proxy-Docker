@@ -1,13 +1,17 @@
-# Ciallo Ms-365 OpenAI Proxy Docker
+# Ciallo Ms-365 OpenAI Proxy (Docker)
 
 将 Microsoft 365 Copilot 暴露为 OpenAI 兼容 API 的 Docker 代理服务。
 
 基于 [m365-copilot-openai-proxy](https://github.com/kuchris/m365-copilot-openai-proxy)，封装为 Docker 镜像，支持：
 
-- 自动刷新 Token
-- 一键推送 Token + Cookie
+- 按需刷新 Token（空闲自动暂停，有请求时自动唤醒）
+- Chromium headless 自动刷新 Token
+- Tampermonkey 油猴脚本一键推送 Token + Cookie
+- 多架构镜像 (amd64 + arm64)
 - API Key 认证保护
-- Web 管理页面
+- Web 管理页面（密码保护）
+- CORS 跨域支持
+- 中英双语切换
 
 ## 快速部署
 
@@ -23,30 +27,28 @@ cp .env.example .env
 docker-compose up -d
 ```
 
-服务在 `http://localhost:8000` 启动，打开浏览器访问即为 Web 管理页面。首次访问需输入管理密码（默认为 API Key 值）。
+服务在 `http://localhost:8000` 启动，打开浏览器访问即为 Web 管理页面。首次访问需输入管理密码（默认 API Key 值 `ciallo`）。
 
 ### 3. 推送 Token
 
-#### 方式一：一键推送（推荐）
+#### 方式一：油猴脚本（推荐）
 
 1. 安装 [Tampermonkey BETA](https://www.tampermonkey.net/) 浏览器扩展
 2. 点击 Tampermonkey BETA 图标 → **添加新脚本**
 3. 将 [get_token.js](https://raw.githubusercontent.com/MurasameCyan/ciallo-ms365-openai-proxy/main/docker/get_token.js) 的内容粘贴进去，保存
-4. 打开 [M365 Copilot](https://m365.cloud.microsoft/chat) 并登录你的账号
+4. 打开 [M365 Copilot](https://m365.cloud.microsoft/chat) 并登录你的 M365 账号
 5. 在 Copilot 对话框中**输入任意字符**触发 WebSocket 连接
 6. 页面右上角弹出 Token 提取面板
 7. 点击 **One-Click Setup** — 自动推送 Cookie + Token 到代理服务
 
-> **首次需要先推送 Cookie** 让 Chromium 登录 M365，之后 Auto Capture 即可自动刷新 Token。
+> **首次需要先推送 Cookie** 让 Chromium headless 登录 M365，之后 Auto Capture 即可自动刷新 Token。
 
-#### 方式二：手动导入
+#### 方式二：手动粘贴
 
 1. 在浏览器中打开 M365 Copilot
 2. F12 → Network → WS → 找到 `wss://substrate.office.com/...` 连接
 3. 复制 URL 中的 `access_token` 参数值
 4. 粘贴到 Web 管理页面的 **Update Token** 输入框，点击 **Update Token**
-
-> **手动导入不支持自动刷新 Token 功能**
 
 #### 查看状态
 
@@ -54,20 +56,48 @@ Web 管理页面显示 Token 有效性和 Chromium 登录状态。点击 **Check
 
 ## API 端点
 
+### OpenAI 兼容 API（需 API Key）
+
 | 端点                              | 说明                                |
 | --------------------------------- | ----------------------------------- |
-| `GET /healthz`                  | 健康检查                            |
-| `GET /v1/token/status`          | Token 有效性与过期时间              |
-| `POST /v1/token/update`         | 手动推送 Token                      |
-| `POST /v1/token/auto-capture`   | 触发 Chromium 自动捕获 Token        |
-| `POST /v1/cookie/inject`        | 注入 Cookie 到 Chromium             |
-| `GET /v1/chromium/login-status` | Chromium 登录状态                   |
-| `POST /admin/login`             | Web 管理页面登录                    |
-| `POST /v1/token/auto-refresh-toggle` | 切换自动刷新开关                |
 | `GET /v1/models`                | 模型列表                            |
 | `POST /v1/chat/completions`     | OpenAI Chat Completions（支持流式） |
 | `POST /v1/responses`            | OpenAI Responses API（支持流式）    |
 | `POST /v1/messages`             | Anthropic Messages API（支持流式）  |
+
+### 管理端点（免 API Key，需 Web 管理密码）
+
+| 端点                              | 说明                                |
+| --------------------------------- | ----------------------------------- |
+| `GET /healthz`                  | 健康检查                            |
+| `GET /admin/token/status`       | Token 有效性与自动刷新状态              |
+| `POST /admin/token/update`      | 手动推送 Token                      |
+| `POST /admin/token/auto-capture` | 触发 Chromium 自动捕获 Token        |
+| `POST /admin/token/auto-refresh-toggle` | 切换自动刷新开关          |
+| `POST /admin/cookie/inject`     | 注入 Cookie 到 Chromium             |
+| `GET /admin/chromium/login-status` | Chromium 登录状态                |
+| `POST /admin/login`             | Web 管理页面登录                    |
+
+> 管理 API 路径与 OpenAI 兼容 API 分离（`/admin/` vs `/v1/`），避免客户端误触发按需刷新。
+
+## 按需刷新机制
+
+默认采用按需刷新模式，降低长时间保持连接的账号风控：
+
+1. **自动刷新启动** — 容器启动后自动刷新 Token
+2. **空闲自动暂停** — 超过 `IDLE_TIMEOUT_MINUTES`（默认 30 分钟）无 `/v1/` API 请求时，自动暂停刷新
+3. **请求触发唤醒** — 当有新的 `/v1/` 请求且 Token 已过期，自动唤醒刷新，暂停请求 → 刷新 Token → 恢复请求
+4. **Web 按钮控制** — 可通过 Web 页面手动启用/暂停自动刷新
+
+```
+/v1/ 请求 → 记录 last_request_time → 检查 token 有效性
+                                        ├─ 有效 → 正常处理
+                                        └─ 过期 + auto_refresh 暂停 → 唤醒刷新 → 等待 → 正常处理
+
+_auto_refresh_loop → 检查 auto_refresh_enabled → 检查空闲时间
+                        ├─ 启用 + 有请求 → 正常刷新
+                        └─ 暂停或空闲超时 → 休眠等待
+```
 
 ## 环境变量
 
@@ -76,19 +106,20 @@ Web 管理页面显示 Token 有效性和 Chromium 登录状态。点击 **Check
 | `M365_ACCESS_TOKEN`      | 否   | —                  | Substrate Token，留空则由 Chromium 自动捕获 |
 | `M365_TIME_ZONE`         | 否   | `Asia/Shanghai`   | 发送给 Copilot 的时区                       |
 | `M365_MODEL_ALIAS`       | 否   | `m365-copilot`    | 模型名称                                    |
-| `API_KEY`                | 否   | `ciallo` | API Key 认证密钥，同时作为 Web 管理密码     |
+| `API_KEY`                | 否   | `ciallo`          | API Key 认证密钥，同时作为 Web 管理密码     |
 | `AUTO_REFRESH`           | 否   | `true`            | 是否自动刷新 Token                          |
 | `REFRESH_BEFORE_SECONDS` | 否   | `300`             | Token 过期前多少秒开始刷新                  |
+| `IDLE_TIMEOUT_MINUTES`   | 否   | `30`              | 空闲多少分钟无请求后暂停自动刷新            |
 | `CHROME_CDP_PORT`        | 否   | `9222`            | Chromium CDP 端口                           |
 
 ## 客户端配置
 
-| 设置             | 值                                                  |
-| ---------------- | --------------------------------------------------- |
-| Base URL         | `http://your-server:8000/v1`                      |
+| 设置             | 值                                                |
+| ---------------- | ------------------------------------------------- |
+| Base URL         | `http://your-server:8000/v1`                    |
 | API Key          | 你设置的 `API_KEY` 值（默认 `ciallo`） |
-| Model            | `m365-copilot`                                    |
-| Persistent model | `m365-copilot:persist`                            |
+| Model            | `m365-copilot`                                  |
+| Persistent model | `m365-copilot:persist`                          |
 
 ### Claude Code
 
@@ -110,7 +141,7 @@ Model: m365-copilot
 
 ### API Key
 
-默认 API Key 为 `ciallo`。在 `.env` 中设置 `API_KEY=your-secret-key` 可修改。所有 API 请求需携带 `Authorization: Bearer your-key` 头。
+默认 API Key 为 `ciallo`。在 `.env` 中设置 `API_KEY=your-secret-key` 可修改。所有 `/v1/` API 请求需携带 `Authorization: Bearer your-key` 头。
 
 ```bash
 curl -H "Authorization: Bearer ciallo" http://localhost:8000/v1/models
@@ -136,9 +167,10 @@ curl -H "Authorization: Bearer ciallo" http://localhost:8000/v1/models
   │   └─ 通过 CDP 自动捕获 Substrate WebSocket Token
   │
   └─ ciallo-ms365-proxy serve (端口 8000)
+      ├─ /v1/* — OpenAI 兼容 API（按需刷新 + 记录请求时间）
+      ├─ /admin/* — 管理端点（Token/Cookie/Login 管理）
       ├─ Web 管理页面 (/) — 密码保护
-      ├─ Token 过期前 5 分钟自动刷新
-      └─ 提供 OpenAI 兼容 API
+      └─ 按需刷新：空闲暂停 → 请求唤醒 → 自动刷新
 ```
 
 ## License

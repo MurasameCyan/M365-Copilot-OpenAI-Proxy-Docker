@@ -33,6 +33,8 @@ def create_app(
     app.state.token_store = AccessTokenStore(resolved_settings.access_token)
     app.state.session_store = PersistentSessionStore()
     app.state.auto_refresh_enabled = True
+    app.state.last_request_time = time.time()
+    app.state.idle_timeout_minutes = resolved_settings.idle_timeout_minutes
     app.state.copilot_client_factory = copilot_client_factory or (
         lambda: SubstrateCopilotClient(app.state.token_store.get(), resolved_settings.time_zone)
     )
@@ -70,11 +72,23 @@ def create_app(
             resp.headers["Access-Control-Allow-Headers"] = "Content-Type, Authorization, x-m365-session-id"
             resp.headers["Access-Control-Max-Age"] = "86400"
             return resp
+        path = request.url.path
+        # Track last request time for idle detection
+        if path.startswith("/v1/"):
+            app.state.last_request_time = time.time()
+            # On-demand refresh: if auto_refresh paused and token expired, wake it up
+            if not app.state.auto_refresh_enabled and app.state.token_store.get():
+                try:
+                    from .token_store import decode_jwt_payload
+                    claims = decode_jwt_payload(app.state.token_store.get())
+                    if time.time() > claims.get("exp", 0):
+                        app.state.auto_refresh_enabled = True
+                except Exception:
+                    pass
         if not resolved_settings.api_key:
             return await call_next(request)
-        # Skip auth for admin page and health endpoints
-        path = request.url.path
-        if path in ("/", "/favicon.ico", "/healthz", "/v1/token/status", "/v1/token/update", "/v1/token/auto-capture", "/v1/token/auto-refresh-toggle", "/v1/cookie/inject", "/v1/chromium/login-status", "/admin/login"):
+        # Skip auth for admin page and management endpoints
+        if path in ("/", "/favicon.ico", "/healthz", "/admin/token/status", "/admin/token/update", "/admin/token/auto-capture", "/admin/token/auto-refresh-toggle", "/admin/cookie/inject", "/admin/chromium/login-status", "/admin/login"):
             return await call_next(request)
         auth = request.headers.get("Authorization", "")
         match = re.match(r"^Bearer\s+(.+)$", auth, re.IGNORECASE)
@@ -112,18 +126,18 @@ def create_app(
     async def healthz() -> dict:
         return {"status": "ok", "token": app.state.token_store.status()}
 
-    @app.get("/v1/token/status")
+    @app.get("/admin/token/status")
     async def token_status() -> dict:
         status = app.state.token_store.status()
         status["auto_refresh"] = app.state.auto_refresh_enabled
         return status
 
-    @app.post("/v1/token/auto-refresh-toggle")
+    @app.post("/admin/token/auto-refresh-toggle")
     async def toggle_auto_refresh() -> dict:
         app.state.auto_refresh_enabled = not app.state.auto_refresh_enabled
         return {"status": "ok", "auto_refresh": app.state.auto_refresh_enabled}
 
-    @app.post("/v1/token/update")
+    @app.post("/admin/token/update")
     async def update_token(request: Request) -> dict:
         body = await request.json()
         token = body.get("token", "").strip()
@@ -152,7 +166,7 @@ def create_app(
         app.state.token_store._mtime_ns = None
         return {"status": "ok", "message": "Token updated", "token_status": app.state.token_store.status()}
 
-    @app.post("/v1/token/auto-capture")
+    @app.post("/admin/token/auto-capture")
     async def auto_capture_token() -> dict:
         """Auto-capture token from Chromium CDP running inside the container."""
         import asyncio
@@ -170,7 +184,7 @@ def create_app(
         app.state.token_store._mtime_ns = None
         return {"status": "ok", "message": "Token auto-captured", "token_status": app.state.token_store.status()}
 
-    @app.post("/v1/cookie/inject")
+    @app.post("/admin/cookie/inject")
     async def inject_cookie(request: Request) -> dict:
         """Inject cookies into Chromium via CDP to log in to M365."""
         body = await request.json()
@@ -248,7 +262,7 @@ def create_app(
 
         return {"status": "ok", "message": f"Injected {injected}/{len(cookies)} cookies. Page navigating to M365...", "injected": injected, "total": len(cookies)}
 
-    @app.get("/v1/chromium/login-status")
+    @app.get("/admin/chromium/login-status")
     async def chromium_login_status() -> dict:
         """Check if Chromium is logged in to M365 Copilot."""
         import httpx as _httpx
@@ -679,11 +693,11 @@ a:hover{text-decoration:underline}
 <div class="api-info" style="margin-top:.5rem">
 <strong style="color:#e2e8f0" data-i18n="title_api_endpoints">API 端点</strong><br><br>
 GET  /healthz<br>
-GET  /v1/token/status<br>
-POST /v1/token/update<br>
-POST /v1/token/auto-capture<br>
-POST /v1/cookie/inject<br>
-GET  /v1/chromium/login-status<br>
+GET  /admin/token/status<br>
+POST /admin/token/update<br>
+POST /admin/token/auto-capture<br>
+POST /admin/cookie/inject<br>
+GET  /admin/chromium/login-status<br>
 GET  /v1/models<br>
 POST /v1/chat/completions<br>
 POST /v1/responses<br>
@@ -769,7 +783,7 @@ applyLang();
 
 async function loadStatus(){
   try{
-    const r=await fetch('/v1/token/status');
+    const r=await fetch('/admin/token/status');
     const d=await r.json();
     const v=d.valid;
     const cls=v?'valid':'invalid';
@@ -788,7 +802,7 @@ async function loadStatus(){
 
 async function loadChromiumStatus(){
   try{
-    const r=await fetch('/v1/chromium/login-status');
+    const r=await fetch('/admin/chromium/login-status');
     const d=await r.json();
     if(!d.chromium_running){
       document.getElementById('chromium-status').innerHTML='<div class="status-row"><span class="status-label">Chromium</span><span class="status-value invalid">'+t('chromium_not_running')+'</span></div>';
@@ -829,7 +843,7 @@ async function toggleAutoRefresh(){
   const btn=document.getElementById('btn-stop-refresh');
   btn.disabled=true;msg.className='msg';msg.textContent='';
   try{
-    const r=await fetch('/v1/token/auto-refresh-toggle',{method:'POST'});
+    const r=await fetch('/admin/token/auto-refresh-toggle',{method:'POST'});
     const d=await r.json();
     if(r.ok){
       msg.className='msg ok';msg.textContent=d.auto_refresh?t('auto_refresh_started'):t('auto_refresh_stopped');
@@ -849,7 +863,7 @@ async function updateToken(){
   if(!input){msg.className='msg err';msg.textContent=lang==='zh'?'请粘贴 Token':'Please paste a token';return}
   btn.disabled=true;msg.className='msg';msg.textContent='';
   try{
-    const r=await fetch('/v1/token/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:input})});
+    const r=await fetch('/admin/token/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:input})});
     const d=await r.json();
     if(r.ok){
       msg.className='msg ok';msg.textContent=(lang==='zh'?'Token 已更新！剩余：':'Token updated! Remaining: ')+fmtSec(d.token_status?.seconds_remaining);
@@ -870,7 +884,7 @@ async function autoCapture(){
   msg.className='msg';msg.textContent='';
   btn.textContent=t('capturing_btn');
   try{
-    const r=await fetch('/v1/token/auto-capture',{method:'POST'});
+    const r=await fetch('/admin/token/auto-capture',{method:'POST'});
     const d=await r.json();
     if(r.ok){
       msg.className='msg ok';msg.textContent=t('auto_captured')+fmtSec(d.token_status?.seconds_remaining);
@@ -888,7 +902,7 @@ async function checkLogin(){
   msg.className='msg';msg.textContent=t('check_login');
   await new Promise(r=>setTimeout(r,1500));
   try{
-    const r=await fetch('/v1/chromium/login-status');
+    const r=await fetch('/admin/chromium/login-status');
     const d=await r.json();
     msg.className=d.logged_in?'msg ok':'msg err';
     msg.textContent=d.logged_in?t('login_ok'):t('login_not_ok');
