@@ -5,10 +5,11 @@ import re
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
+from pathlib import Path
 
 from fastapi import Depends, FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 
 from .config import Settings
 from .session_store import PersistentSession, PersistentSessionStore
@@ -70,6 +71,39 @@ def create_app(
     @app.get("/v1/token/status")
     async def token_status() -> dict:
         return app.state.token_store.status()
+
+    @app.post("/v1/token/update")
+    async def update_token(request: Request) -> dict:
+        body = await request.json()
+        token = body.get("token", "").strip()
+        if not token:
+            return JSONResponse(status_code=400, content={"error": "Token is empty"})
+        # Extract token from full WebSocket URL if needed
+        match = re.search(r"access_token=([^&\s]+)", token)
+        if match:
+            token = match.group(1)
+        if not token.startswith("eyJ"):
+            return JSONResponse(status_code=400, content={"error": "Not a valid JWT token"})
+        # Write to .env
+        env_path = Path(".env")
+        token_line_pattern = r"(?m)^M365_ACCESS_TOKEN=.*$"
+        if env_path.exists():
+            text = env_path.read_text(encoding="utf-8")
+            if re.search(token_line_pattern, text):
+                text = re.sub(token_line_pattern, f"M365_ACCESS_TOKEN={token}", text)
+            else:
+                text += f"\nM365_ACCESS_TOKEN={token}\n"
+        else:
+            text = f"M365_ACCESS_TOKEN={token}\n"
+        env_path.write_text(text, encoding="utf-8")
+        # Update in-memory store
+        app.state.token_store._token = token
+        app.state.token_store._mtime_ns = None
+        return {"status": "ok", "message": "Token updated", "token_status": app.state.token_store.status()}
+
+    @app.get("/", response_class=HTMLResponse)
+    async def admin_page() -> str:
+        return _ADMIN_HTML
 
     @app.get("/v1/models")
     async def list_models(settings: Settings = Depends(get_settings)) -> dict:
@@ -312,3 +346,116 @@ async def _anthropic_stream(
     yield sse("content_block_stop", {"type": "content_block_stop", "index": 0})
     yield sse("message_delta", {"type": "message_delta", "delta": {"stop_reason": "end_turn", "stop_sequence": None}, "usage": {"output_tokens": 0}})
     yield sse("message_stop", {"type": "message_stop"})
+
+
+_ADMIN_HTML = """<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>M365 Copilot Proxy Admin</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;background:#0f172a;color:#e2e8f0;min-height:100vh;padding:2rem}
+.container{max-width:720px;margin:0 auto}
+h1{font-size:1.5rem;margin-bottom:1.5rem;background:linear-gradient(135deg,#06b6d4,#8b5cf6);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.card{background:#1e293b;border-radius:12px;padding:1.5rem;margin-bottom:1.5rem;border:1px solid #334155}
+.card h2{font-size:1.1rem;margin-bottom:1rem;color:#94a3b8}
+.status-row{display:flex;justify-content:space-between;align-items:center;padding:.5rem 0;border-bottom:1px solid #334155}
+.status-row:last-child{border:none}
+.status-label{color:#94a3b8;font-size:.9rem}
+.status-value{font-weight:600;font-size:.9rem}
+.valid{color:#22c55e}.invalid{color:#ef4444}.warn{color:#f59e0b}
+textarea{width:100%;height:120px;background:#0f172a;border:1px solid #475569;border-radius:8px;color:#e2e8f0;padding:.75rem;font-family:monospace;font-size:.8rem;resize:vertical;margin-bottom:.75rem}
+textarea:focus{outline:none;border-color:#06b6d4}
+button{background:linear-gradient(135deg,#06b6d4,#8b5cf6);color:#fff;border:none;border-radius:8px;padding:.7rem 1.5rem;font-size:.9rem;font-weight:600;cursor:pointer;transition:opacity .2s}
+button:hover{opacity:.85}
+button:disabled{opacity:.5;cursor:not-allowed}
+.msg{padding:.6rem 1rem;border-radius:8px;font-size:.85rem;margin-top:.5rem;display:none}
+.msg.ok{display:block;background:#052e16;color:#22c55e;border:1px solid #166534}
+.msg.err{display:block;background:#450a0a;color:#ef4444;border:1px solid #991b1b}
+.api-info{margin-top:1rem;padding:.75rem;background:#0f172a;border-radius:8px;font-family:monospace;font-size:.8rem;color:#64748b;line-height:1.6}
+a{color:#06b6d4;text-decoration:none}
+a:hover{text-decoration:underline}
+</style>
+</head>
+<body>
+<div class="container">
+<h1>M365 Copilot Proxy</h1>
+
+<div class="card">
+<h2>Token Status</h2>
+<div id="status-content"><span style="color:#64748b">Loading...</span></div>
+</div>
+
+<div class="card">
+<h2>Update Token</h2>
+<p style="color:#64748b;font-size:.85rem;margin-bottom:.75rem">Paste the access_token value or the full wss:// URL from <a href="https://m365.cloud.microsoft/chat" target="_blank">M365 Copilot</a></p>
+<textarea id="token-input" placeholder="eyJ0eXAiOiJKV1QiLCJhbGci...&#10;&#10;or full URL:&#10;wss://substrate.office.com/m365Copilot/Chathub/...?access_token=eyJ..."></textarea>
+<button id="btn-update" onclick="updateToken()">Update Token</button>
+<div id="update-msg" class="msg"></div>
+</div>
+
+<div class="card">
+<h2>API Endpoints</h2>
+<div class="api-info">
+GET  /healthz<br>
+GET  /v1/token/status<br>
+POST /v1/token/update<br>
+GET  /v1/models<br>
+POST /v1/chat/completions<br>
+POST /v1/responses<br>
+POST /v1/messages
+</div>
+</div>
+</div>
+
+<script>
+async function loadStatus(){
+  try{
+    const r=await fetch('/v1/token/status');
+    const d=await r.json();
+    const v=d.valid;
+    const cls=v?'valid':'invalid';
+    const exp=d.expires_at?new Date(d.expires_at).toLocaleString():'N/A';
+    document.getElementById('status-content').innerHTML=
+      '<div class="status-row"><span class="status-label">Valid</span><span class="status-value '+cls+'">'+(v?'Yes':'No')+'</span></div>'+
+      '<div class="status-row"><span class="status-label">Expires</span><span class="status-value '+(v&&d.seconds_remaining<600?'warn':'')+'">'+exp+'</span></div>'+
+      '<div class="status-row"><span class="status-label">Remaining</span><span class="status-value '+(v&&d.seconds_remaining<600?'warn':'')+'">'+fmtSec(d.seconds_remaining)+'</span></div>'+
+      (d.error?'<div class="status-row"><span class="status-label">Error</span><span class="status-value invalid">'+d.error+'</span></div>':'');
+  }catch(e){
+    document.getElementById('status-content').innerHTML='<span class="invalid">Failed to load</span>';
+  }
+}
+
+function fmtSec(s){
+  if(!s&&s!==0)return'N/A';
+  const h=Math.floor(s/3600),m=Math.floor(s%3600/60),sec=s%60;
+  return(h?h+'h ':'')+(m?m+'m ':'')+sec+'s';
+}
+
+async function updateToken(){
+  const input=document.getElementById('token-input').value.trim();
+  const msg=document.getElementById('update-msg');
+  const btn=document.getElementById('btn-update');
+  if(!input){msg.className='msg err';msg.textContent='Please paste a token';return}
+  btn.disabled=true;msg.className='msg';msg.textContent='';
+  try{
+    const r=await fetch('/v1/token/update',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:input})});
+    const d=await r.json();
+    if(r.ok){
+      msg.className='msg ok';msg.textContent='Token updated! Remaining: '+fmtSec(d.token_status?.seconds_remaining);
+      document.getElementById('token-input').value='';
+      loadStatus();
+    }else{
+      msg.className='msg err';msg.textContent=d.error||'Update failed';
+    }
+  }catch(e){msg.className='msg err';msg.textContent='Network error: '+e}
+  finally{btn.disabled=false}
+}
+
+loadStatus();
+setInterval(loadStatus,60000);
+</script>
+</body>
+</html>"""

@@ -1,4 +1,4 @@
-# M365 Copilot OpenAI Proxy
+# M365 Copilot OpenAI Proxy [Docker](https://github.com/MurasameCyan/M365-Copilot-OpenAI-Proxy-Docker)
 
 将 Microsoft 365 Copilot 暴露为 OpenAI 兼容 API 的 Docker 代理服务。
 
