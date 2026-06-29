@@ -63,6 +63,7 @@ Web 管理页面显示 Token 有效性和 Chromium 登录状态。点击 **Check
 | `POST /v1/cookie/inject`        | 注入 Cookie 到 Chromium             |
 | `GET /v1/chromium/login-status` | Chromium 登录状态                   |
 | `POST /admin/login`             | Web 管理页面登录                    |
+| `POST /v1/token/auto-refresh-toggle` | 切换自动刷新开关                |
 | `GET /v1/models`                | 模型列表                            |
 | `POST /v1/chat/completions`     | OpenAI Chat Completions（支持流式） |
 | `POST /v1/responses`            | OpenAI Responses API（支持流式）    |

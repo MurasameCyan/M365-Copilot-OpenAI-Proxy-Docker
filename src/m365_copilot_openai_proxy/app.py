@@ -694,8 +694,8 @@ POST /v1/messages
 <script>
 const i18n={
   zh:{
-    title_update_token:'更新 Token',btn_update:'更新 Token',btn_check_login:'检查登录',btn_auto_capture:'自动捕获',
-    title_status:'Token 与登录状态',loading:'加载中...',
+    title_update_token:'更新 Token',btn_update:'更新 Token',btn_check_login:'检查登录',btn_auto_capture:'自动刷新',
+    title_status:'Token 与 登录状态',loading:'加载中...',
     title_quick_start:'快速开始',qs_recommended:'推荐：',qs_install_script:'安装油猴脚本（',
     qs_open_copilot:'打开',qs_type_trigger:'输入内容触发 WebSocket，然后在脚本面板点击',qs_push_token:'推送 Token',
     qs_alternative:'备选：',qs_manual_copy:'在 DevTools（Network → WS → wss://substrate.office.com/...）中手动复制 ',
@@ -704,7 +704,7 @@ const i18n={
     valid:'有效',invalid:'无效',expires:'过期时间',remaining:'剩余',error:'错误',
     login:'登录',logged_in:'已登录',not_logged_in:'未登录（仅手动推送 Token）',
     page:'页面',title:'标题',chromium_not_running:'Chromium 未运行',
-    capturing:'捕获中...',auto_captured:'自动捕获成功！剩余：',auto_capture_failed:'自动捕获失败',
+    capturing:'捕获中...',auto_captured:'自动刷新成功！剩余：',auto_capture_failed:'自动刷新失败',
     check_login:'检查登录中...',login_ok:'Chromium 已登录！自动刷新已启用。',
     login_not_ok:'未登录。请先使用油猴脚本推送 Cookie。',check_failed:'检查失败：',
     capturing_btn:'捕获中...',check_btn:'检查中...',
