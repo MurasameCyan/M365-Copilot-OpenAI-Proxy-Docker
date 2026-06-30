@@ -78,7 +78,7 @@ def create_app(
         # Track last request time for idle detection & on-demand refresh
         if path.startswith("/v1/"):
             app.state.last_request_time = time.time()
-            # On-demand refresh: if auto_refresh paused and token expired (or no token), wake it up and wait
+            # On-demand refresh: if auto_refresh paused and token expired (or no token), refresh synchronously
             if not app.state.auto_refresh_enabled:
                 token = app.state.token_store.get()
                 need_wake = False
@@ -93,19 +93,20 @@ def create_app(
                     except Exception:
                         need_wake = True
                 if need_wake:
+                    # Wake up background loop
                     app.state.auto_refresh_enabled = True
-                    # Wait for token to be refreshed by _auto_refresh_loop (up to 60s)
-                    import asyncio
-                    for _ in range(60):
-                        await asyncio.sleep(1)
-                        new_token = app.state.token_store.get()
-                        if new_token and new_token != token:
-                            try:
-                                claims = decode_jwt_payload(new_token)
-                                if time.time() < claims.get("exp", 0):
-                                    break
-                            except Exception:
-                                pass
+                    # Also refresh synchronously so the request doesn't have to wait for the loop
+                    try:
+                        from .cli import _cdp_extract_token, _write_token
+                        cdp_port = getattr(app.state, 'settings', None) and getattr(app.state.settings, 'cdp_port', 9222) or 9222
+                        import asyncio
+                        new_token = await _cdp_extract_token(cdp_port, allow_nudge=True)
+                        if new_token:
+                            _write_token(new_token)
+                            app.state.token_store._token = new_token
+                            app.state.token_store._mtime_ns = None
+                    except Exception:
+                        pass  # If sync refresh fails, the background loop will keep trying
         if not resolved_settings.api_key:
             return await call_next(request)
         # Skip auth for admin page (has its own cookie check) and health endpoints
