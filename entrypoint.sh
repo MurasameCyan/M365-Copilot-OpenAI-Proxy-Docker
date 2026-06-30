@@ -12,9 +12,13 @@ if [ "$(id -u)" = "0" ]; then
     mkdir -p "$CHROME_PROFILE" 2>/dev/null || true
     rm -f "$CHROME_PROFILE/SingletonLock" "$CHROME_PROFILE/SingletonCookie" "$CHROME_PROFILE/SingletonSocket" 2>/dev/null || true
 
-    # Re-exec as app user, preserving environment but fixing HOME
+    # Prepare token storage on tmpfs-backed volume
+    mkdir -p /home/app/token 2>/dev/null || true
+    chown -R app:app /home/app/token 2>/dev/null || true
+
+    # Re-exec as app user via gosu (does NOT preserve environment wholesale — safer)
     export HOME=/home/app
-    exec runuser -u app --preserve-environment -- "$0" "$@"
+    exec gosu app "$0" "$@"
 fi
 
 # --- Below runs as app user ---
@@ -38,11 +42,11 @@ if [ -n "$CHROME_BIN" ] && [ "$AUTO_REFRESH" = "true" ]; then
     echo "Starting $CHROME_BIN headless on CDP port $CDP_PORT ..."
     "$CHROME_BIN" \
         --headless=new \
-        --no-sandbox \
-        --disable-gpu \
+        --remote-debugging-address=127.0.0.1 \
         --remote-debugging-port="$CDP_PORT" \
         --user-data-dir="$CHROME_PROFILE" \
         --no-first-run \
+        --disable-gpu \
         --disable-dev-shm-usage \
         --disable-software-rasterizer \
         --disable-background-networking \

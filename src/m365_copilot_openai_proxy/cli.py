@@ -18,7 +18,7 @@ import uvicorn
 import websockets
 
 from .app import create_app
-from .token_store import decode_jwt_payload, is_substrate_token_claims
+from .token_store import decode_jwt_payload, is_substrate_token_claims, read_token as read_token_from_store, write_token as write_token_to_store
 
 
 class _SuppressCtrlC(logging.Filter):
@@ -217,7 +217,7 @@ def _startup_capture_loop(cdp_port: int, timeout_seconds: int) -> None:
     print("Waiting for a Substrate token from the debug Edge M365 Copilot tab...")
     print("If needed: press F5 in Copilot, click the message box, and type one character.")
     if _capture_token_to_env(cdp_port, timeout_seconds):
-        print(".env updated with Substrate token.")
+        print("Token file updated with Substrate token.")
     else:
         print("Startup token capture timed out. Manual set-token is still available.")
 
@@ -309,12 +309,7 @@ def _try_auto_refresh(cdp_port: int, *, allow_nudge: bool = True) -> bool:
 
 
 def _read_token() -> str | None:
-    env_path = Path(".env")
-    if not env_path.exists():
-        return None
-    text = env_path.read_text(encoding="utf-8")
-    match = re.search(r"(?m)^M365_ACCESS_TOKEN=(.*)$", text)
-    return match.group(1).strip().strip("\"'") if match else None
+    return read_token_from_store()
 
 
 def _seconds_remaining(token: str) -> int:
@@ -375,21 +370,7 @@ def _auto_refresh_loop(
 
 
 def _write_token(token: str) -> None:
-    env_path = Path(".env")
-    token_line_pattern = r"(?m)^M365_ACCESS_TOKEN=.*$"
-    if env_path.exists():
-        text = env_path.read_text(encoding="utf-8")
-        if re.search(token_line_pattern, text):
-            text = re.sub(token_line_pattern, f"M365_ACCESS_TOKEN={token}", text)
-        else:
-            text += f"\nM365_ACCESS_TOKEN={token}\n"
-    else:
-        text = f"M365_ACCESS_TOKEN={token}\n"
-    env_path.write_text(text, encoding="utf-8")
-    try:
-        env_path.chmod(0o600)
-    except OSError:
-        pass
+    write_token_to_store(token)
 
 
 def main() -> None:
@@ -464,7 +445,7 @@ def set_token_command(_args) -> None:
         print("Copy the full wss://substrate.office.com/... URL from the Network WebSocket request.")
         return
     _write_token(token)
-    print(".env updated.")
+    print("Token file updated.")
 
 
 def capture_token_command(args: argparse.Namespace) -> None:
@@ -475,7 +456,7 @@ def capture_token_command(args: argparse.Namespace) -> None:
         print("Error: no Substrate WebSocket token captured before timeout.")
         return
     _write_token(token)
-    print(".env updated with Substrate token.")
+    print("Token file updated with Substrate token.")
 
 
 def serve_command(args: argparse.Namespace) -> None:

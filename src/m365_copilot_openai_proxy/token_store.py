@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import threading
 import time
 from datetime import datetime, timezone
@@ -9,6 +10,12 @@ from pathlib import Path
 from typing import Any
 
 SUBSTRATE_AUDIENCE_PREFIX = "https://substrate.office.com/"
+
+# Token storage: prefer isolated token file under TOKEN_DIR volume,
+# fall back to reading from .env for backward compatibility
+_TOKEN_DIR = Path(os.environ.get("TOKEN_DIR", "/home/app/token"))
+_TOKEN_FILE = _TOKEN_DIR / "token"
+_ENV_PATH = Path(".env")
 
 
 def decode_jwt_payload(token: str) -> dict[str, Any]:
@@ -65,16 +72,45 @@ class AccessTokenStore:
         mtime_ns = self._read_mtime()
         if mtime_ns is None or mtime_ns == self._mtime_ns:
             return
-        token = _read_env_token(self._env_path)
+        token = read_token()
         if token:
             self._token = token
             self._mtime_ns = mtime_ns
 
     def _read_mtime(self) -> int | None:
+        # Prefer isolated token file mtime
+        try:
+            return _TOKEN_FILE.stat().st_mtime_ns
+        except FileNotFoundError:
+            pass
+        # Fallback: .env file mtime
         try:
             return self._env_path.stat().st_mtime_ns
         except FileNotFoundError:
             return None
+
+
+def read_token() -> str | None:
+    """Read token from isolated token file first, then fall back to .env."""
+    # Try isolated token file (TOKEN_DIR volume)
+    try:
+        token = _TOKEN_FILE.read_text(encoding="utf-8").strip()
+        if token:
+            return token
+    except FileNotFoundError:
+        pass
+    # Fallback: read from .env for backward compatibility
+    return _read_env_token(_ENV_PATH)
+
+
+def write_token(token: str) -> None:
+    """Write token to isolated token file on TOKEN_DIR volume."""
+    _TOKEN_DIR.mkdir(parents=True, exist_ok=True)
+    _TOKEN_FILE.write_text(token, encoding="utf-8")
+    try:
+        _TOKEN_FILE.chmod(0o600)
+    except OSError:
+        pass
 
 
 def _read_env_token(path: Path) -> str | None:

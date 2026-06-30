@@ -17,3 +17,4 @@ class Settings(BaseSettings):
     api_key: str = Field(default="", alias="API_KEY")
     admin_password: str = Field(default="", alias="ADMIN_PASSWORD")
     idle_timeout_minutes: int = Field(default=30, alias="IDLE_TIMEOUT_MINUTES")
+    token_dir: str = Field(default="/home/app/token", alias="TOKEN_DIR")

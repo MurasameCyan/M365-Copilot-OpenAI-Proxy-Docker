@@ -1,19 +1,24 @@
-FROM python:3.11-slim
+FROM python:3.11-slim-bookworm
 
 # Install Chromium (available on both amd64 and arm64 via Debian repos)
+# NOTE: Chromium version is pinned by Debian repo snapshot; for reproducible builds
+# consider pinning or using Chrome for Testing with explicit version.
 RUN apt-get update && \
     apt-get install -y --no-install-recommends \
         chromium \
         chromium-common \
-        fonts-noto-cjk \
+        fonts-wqy-zenhei \
+        gosu \
+        curl \
     && rm -rf /var/lib/apt/lists/*
 
 # Install uv package manager
 RUN pip install --no-cache-dir uv
 
-# Create non-root user and directories
+# Create non-root user and directories (merged into single RUN to reduce layers)
 RUN groupadd -r app && useradd -r -g app -d /home/app -s /sbin/nologin app && \
-    mkdir -p /chrome-profile /home/app && chown -R app:app /chrome-profile /home/app
+    mkdir -p /chrome-profile /home/app/token /home/app && \
+    chown -R app:app /chrome-profile /home/app
 
 WORKDIR /app
 
@@ -21,8 +26,10 @@ WORKDIR /app
 COPY --chown=app:app pyproject.toml .
 COPY --chown=app:app uv.lock .
 
-# Install Python dependencies
-RUN uv sync --frozen --no-dev && chown -R app:app /app
+# Install Python dependencies as app user (avoids chown -R producing extra layer)
+USER app
+RUN uv sync --frozen --no-dev
+USER root
 
 # Copy project source and entrypoint
 COPY --chown=app:app src/ src/
@@ -32,6 +39,9 @@ RUN chmod +x /entrypoint.sh
 # Persist Chrome user data (login state)
 VOLUME /chrome-profile
 
+# Token storage volume (persist across restarts, isolated from app code)
+VOLUME /home/app/token
+
 # Environment variables (do NOT set M365_ACCESS_TOKEN here — it may leak into image layers)
 ENV M365_TIME_ZONE="Asia/Shanghai"
 ENV M365_MODEL_ALIAS="m365-copilot"
@@ -40,11 +50,12 @@ ENV AUTO_REFRESH="true"
 ENV REFRESH_BEFORE_SECONDS=300
 ENV IDLE_TIMEOUT_MINUTES=30
 ENV ADMIN_PASSWORD=""
+ENV TOKEN_DIR="/home/app/token"
 
 EXPOSE 8000
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
-    CMD python3 -c "import urllib.request; urllib.request.urlopen('http://localhost:8000/healthz', timeout=3)" || exit 1
+    CMD curl -sf http://localhost:8000/healthz || exit 1
 
-# Start as root to fix volume permissions, then drop to app user in entrypoint
+# Start as root to fix volume permissions, then drop to app user via gosu in entrypoint
 ENTRYPOINT ["/entrypoint.sh"]

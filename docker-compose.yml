@@ -8,21 +8,19 @@ services:
       - .env
     volumes:
       - chrome-profile:/chrome-profile
-    environment:
-      - AUTO_REFRESH=true
-      - REFRESH_BEFORE_SECONDS=300
-      - CHROME_CDP_PORT=9222
+      - token-data:/home/app/token
     restart: unless-stopped
     shm_size: "1gb"
-    security_opt:
-      - seccomp=unconfined
     deploy:
       resources:
         limits:
           memory: 2G
-          cpids: 200
+          cpus: "2.0"
+          pids: 200
         reservations:
           memory: 512M
+          cpus: "0.5"
 
 volumes:
   chrome-profile:
+  token-data:

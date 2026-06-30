@@ -17,7 +17,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Stre
 from .config import Settings
 from .session_store import PersistentSession, PersistentSessionStore
 from .substrate_client import SubstrateCopilotClient, SubstrateCopilotError
-from .token_store import AccessTokenStore
+from .token_store import AccessTokenStore, write_token as write_token_to_store
 from .models import AnthropicMessagesRequest, OpenAIChatRequest, OpenAIResponsesRequest
 from .translator import translate_anthropic_request, translate_openai_request, translate_responses_request
 
@@ -125,7 +125,8 @@ def create_app(
                     app.state.auto_refresh_enabled = True
                     # Also refresh synchronously so the request doesn't have to wait for the loop
                     try:
-                        from .cli import _cdp_extract_token, _write_token
+                        from .cli import _cdp_extract_token
+                        from .token_store import write_token as _write_token
                         cdp_port = getattr(app.state, 'settings', None) and getattr(app.state.settings, 'cdp_port', 9222) or 9222
                         import asyncio
                         new_token = await _cdp_extract_token(cdp_port, allow_nudge=True)
@@ -216,19 +217,8 @@ def create_app(
             token = match.group(1)
         if not token.startswith("eyJ"):
             return _json_err(400, "Not a valid JWT token")
-        # Write to .env
-        env_path = Path(".env")
-        token_line_pattern = r"(?m)^M365_ACCESS_TOKEN=.*$"
-        if env_path.exists():
-            text = env_path.read_text(encoding="utf-8")
-            if re.search(token_line_pattern, text):
-                text = re.sub(token_line_pattern, f"M365_ACCESS_TOKEN={token}", text)
-            else:
-                text += f"\nM365_ACCESS_TOKEN={token}\n"
-        else:
-            text = f"M365_ACCESS_TOKEN={token}\n"
-        env_path.write_text(text, encoding="utf-8")
-        os.chmod(env_path, 0o600)
+        # Write to isolated token file
+        write_token_to_store(token)
         # Update in-memory store
         app.state.token_store._token = token
         app.state.token_store._mtime_ns = None
@@ -240,7 +230,8 @@ def create_app(
         err = _require_admin(request)
         if err: return err
         import asyncio
-        from .cli import _cdp_extract_token, _write_token
+        from .cli import _cdp_extract_token
+        from .token_store import write_token as _write_token
         cdp_port = 9222
         try:
             token = await _cdp_extract_token(cdp_port, allow_nudge=True)
@@ -248,7 +239,7 @@ def create_app(
             return _json_err(502, f"CDP capture failed: {exc}")
         if not token:
             return _json_err(404, "No substrate token found. Make sure M365 Copilot is open and logged in in Chromium.")
-        # Write to .env and update in-memory
+        # Write to token file and update in-memory
         _write_token(token)
         app.state.token_store._token = token
         app.state.token_store._mtime_ns = None

@@ -7,3 +7,4 @@ __pycache__/
 image/
 *.md
 LICENSE
+get_token.js
