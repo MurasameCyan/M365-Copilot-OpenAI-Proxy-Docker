@@ -91,37 +91,49 @@
         if (match) {
             latestToken = match[1];
             showPanel();
-            // Intercept .send() to capture the chat invoke payload (contains the
-            // mode/model selection fields). SignalR frames are JSON + \x1e separator.
+            // Intercept .send() to capture outgoing SignalR frames. We capture ALL
+            // non-heartbeat frames (not just chat) because the mode/model selection
+            // may live in a different frame than the chat invoke. SignalR frames are
+            // JSON objects separated by the \x1e record separator.
             try {
                 const origSend = ws.send.bind(ws);
                 ws.send = function(data) {
                     try {
-                        if (typeof data === 'string' && data.indexOf('"target":"chat"') !== -1) {
+                        if (typeof data === 'string' && data.length > 2) {
                             const clean = data.replace(/\x1e/g, '');
-                            const obj = JSON.parse(clean);
-                            const args = (obj.arguments && obj.arguments[0]) || null;
-                            if (args) {
-                                // Strip the bulky/secret fields we don't need for comparison
-                                const slim = JSON.parse(JSON.stringify(args));
-                                if (slim.message) {
-                                    slim.message = {
-                                        author: slim.message.author,
-                                        messageType: slim.message.messageType,
-                                        experienceType: slim.message.experienceType,
-                                        text: (slim.message.text || '').slice(0, 80),
-                                    };
+                            // A single send may contain multiple concatenated frames
+                            for (const frame of data.split('\x1e')) {
+                                const f = frame.trim();
+                                if (!f) continue;
+                                let obj;
+                                try { obj = JSON.parse(f); } catch (e) { continue; }
+                                // Skip pure heartbeat/ack frames (type 6 = ping)
+                                if (obj.type === 6) continue;
+                                const args = (obj.arguments && obj.arguments[0]) || null;
+                                let slim = null;
+                                if (args) {
+                                    slim = JSON.parse(JSON.stringify(args));
+                                    if (slim.message && typeof slim.message === 'object') {
+                                        slim.message = {
+                                            author: slim.message.author,
+                                            messageType: slim.message.messageType,
+                                            experienceType: slim.message.experienceType,
+                                            text: (slim.message.text || '').slice(0, 80),
+                                        };
+                                    }
                                 }
                                 capturedPayloads.unshift({
                                     time: new Date().toLocaleTimeString(),
-                                    optionsSets: args.optionsSets || [],
-                                    tone: args.tone,
-                                    gptId: args.threadLevelGptId,
-                                    pluginOptions: args.pluginOptions,
-                                    modelId: args.modelId || args.gptId || args.model,
-                                    raw: slim,
+                                    frameType: obj.type,
+                                    target: obj.target || '(none)',
+                                    optionsSets: (args && args.optionsSets) || [],
+                                    tone: args && args.tone,
+                                    gptId: args && (args.threadLevelGptId || args.gptId),
+                                    modelId: args && (args.modelId || args.model),
+                                    raw: slim || obj,
+                                    rawText: f.slice(0, 1500),
                                 });
-                                if (capturedPayloads.length > 10) capturedPayloads.pop();
+                                if (capturedPayloads.length > 20) capturedPayloads.pop();
                                 renderCaptured();
                             }
                         }
@@ -364,13 +376,17 @@
             box.innerHTML = '<span style="color:#475569">No chat payload captured yet. Pick a mode and send a message.</span>';
             return;
         }
+        const escHtml = (s) => String(s == null ? '' : s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
         box.innerHTML = capturedPayloads.map((p) => {
             const opts = (p.optionsSets || []).join(', ');
             const gpt = p.gptId && Object.keys(p.gptId).length ? JSON.stringify(p.gptId) : '-';
             return `<div style="border-bottom:1px solid #1e293b; padding:6px 0; font-size:10px; line-height:1.5;">
-                <div style="color:#38bdf8;">${p.time} &nbsp; tone: <b>${p.tone || '-'}</b> &nbsp; model: <b>${p.modelId || '-'}</b></div>
-                <div style="color:#94a3b8;">gptId: ${gpt}</div>
-                <div style="color:#64748b; word-break:break-all;">optionsSets: ${opts}</div>
+                <div style="color:#38bdf8;">${p.time} &nbsp; type: <b>${p.frameType}</b> &nbsp; target: <b>${escHtml(p.target)}</b></div>
+                <div style="color:#38bdf8;">tone: <b>${p.tone || '-'}</b> &nbsp; model: <b>${escHtml(p.modelId) || '-'}</b></div>
+                <div style="color:#94a3b8;">gptId: ${escHtml(gpt)}</div>
+                <div style="color:#64748b; word-break:break-all;">optionsSets: ${escHtml(opts)}</div>
+                <details style="margin-top:3px"><summary style="cursor:pointer; color:#64748b;">raw frame</summary>
+                <pre style="white-space:pre-wrap; word-break:break-all; background:#020617; padding:5px; border-radius:5px; color:#94a3b8; margin-top:2px; max-height:160px; overflow:auto;">${escHtml(p.rawText)}</pre></details>
             </div>`;
         }).join('');
     }
