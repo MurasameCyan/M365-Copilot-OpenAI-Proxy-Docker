@@ -32,8 +32,8 @@ def create_app(
     app.state.settings = resolved_settings
     app.state.token_store = AccessTokenStore(resolved_settings.access_token)
     app.state.session_store = PersistentSessionStore()
-    app.state.auto_refresh_enabled = True
-    app.state.last_request_time = time.time()
+    app.state.auto_refresh_enabled = False  # On-demand: only refresh when /v1/ requests come in
+    app.state.last_request_time = 0  # 0 means never received any /v1/ request
     app.state.idle_timeout_minutes = resolved_settings.idle_timeout_minutes
     if not resolved_settings.api_key:
         print("WARNING: API_KEY is not set. All /v1/ API endpoints are open without authentication. Set API_KEY in .env to secure your instance.")
@@ -75,18 +75,25 @@ def create_app(
             resp.headers["Access-Control-Max-Age"] = "86400"
             return resp
         path = request.url.path
-        # Track last request time for idle detection
+        # Track last request time for idle detection & on-demand refresh
         if path.startswith("/v1/"):
             app.state.last_request_time = time.time()
-            # On-demand refresh: if auto_refresh paused and token expired, wake it up
-            if not app.state.auto_refresh_enabled and app.state.token_store.get():
-                try:
-                    from .token_store import decode_jwt_payload
-                    claims = decode_jwt_payload(app.state.token_store.get())
-                    if time.time() > claims.get("exp", 0):
-                        app.state.auto_refresh_enabled = True
-                except Exception:
-                    pass
+            # On-demand refresh: if auto_refresh paused and token expired (or no token), wake it up
+            if not app.state.auto_refresh_enabled:
+                token = app.state.token_store.get()
+                need_wake = False
+                if not token:
+                    need_wake = True
+                else:
+                    try:
+                        from .token_store import decode_jwt_payload
+                        claims = decode_jwt_payload(token)
+                        if time.time() > claims.get("exp", 0):
+                            need_wake = True
+                    except Exception:
+                        need_wake = True
+                if need_wake:
+                    app.state.auto_refresh_enabled = True
         if not resolved_settings.api_key:
             return await call_next(request)
         # Skip auth for admin page (has its own cookie check) and health endpoints

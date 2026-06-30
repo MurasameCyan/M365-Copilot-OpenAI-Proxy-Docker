@@ -332,17 +332,23 @@ def _auto_refresh_loop(
     while not stop_event.is_set():
         # Respect on-demand mode: if auto_refresh disabled, sleep and check again
         if app_state is not None and not app_state.auto_refresh_enabled:
-            stop_event.wait(5)
+            stop_event.wait(10)
             continue
 
         # Idle detection: if no /v1/ requests for idle_timeout_minutes, pause auto-refresh
         if app_state is not None:
-            idle_seconds = time.time() - getattr(app_state, 'last_request_time', time.time())
+            last_req = getattr(app_state, 'last_request_time', 0)
+            # last_request_time=0 means no /v1/ request ever received, stay paused
+            if last_req == 0:
+                app_state.auto_refresh_enabled = False
+                stop_event.wait(10)
+                continue
+            idle_seconds = time.time() - last_req
             idle_timeout = getattr(app_state, 'idle_timeout_minutes', 30) * 60
             if idle_seconds > idle_timeout:
                 app_state.auto_refresh_enabled = False
                 print(f"No /v1/ requests for {idle_seconds:.0f}s (> {idle_timeout}s); auto-refresh paused (on-demand mode).")
-                stop_event.wait(5)
+                stop_event.wait(10)
                 continue
 
         token = _read_token()
