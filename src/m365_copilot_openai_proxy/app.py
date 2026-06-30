@@ -789,10 +789,29 @@ function applyLang(){
 }
 applyLang();
 
+function showInlineLogin(){
+  document.body.innerHTML='<div style="display:flex;align-items:center;justify-content:center;min-height:100vh;background:#0f172a;color:#e2e8f0;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif"><div style="background:#1e293b;border-radius:14px;padding:2.5rem;width:360px;border:1px solid #334155;text-align:center"><h1 style="font-size:1.3rem;margin-bottom:.5rem;background:linear-gradient(135deg,#06b6d4,#8b5cf6);-webkit-background-clip:text;-webkit-text-fill-color:transparent">Ciallo Ms-365 OpenAI Proxy</h1><p style="color:#64748b;font-size:.85rem;margin-bottom:1.5rem">Enter admin password to continue</p><input id="pw" type="password" placeholder="API Key / Password" autofocus onkeydown="if(event.key===Enter)doInlineLogin()" style="width:100%;padding:.75rem 1rem;background:#0f172a;border:1px solid #475569;border-radius:8px;color:#e2e8f0;font-size:.9rem;outline:none;margin-bottom:1rem"><button onclick="doInlineLogin()" style="width:100%;background:linear-gradient(135deg,#06b6d4,#8b5cf6);color:#fff;border:none;border-radius:8px;padding:.75rem;font-size:.95rem;font-weight:600;cursor:pointer">Login</button><div id="ilm" style="padding:.5rem .75rem;border-radius:6px;font-size:.8rem;margin-top:.75rem;display:none"></div></div></div>';
+}
+
+async function doInlineLogin(){
+  const pw=document.getElementById('pw').value;
+  const btn=document.querySelector('button');
+  const msg=document.getElementById('ilm');
+  btn.disabled=true;msg.style.display='none';
+  try{
+    const r=await fetch('/admin/login',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({password:pw})});
+    if(r.ok){location.reload();return}
+    const d=await r.json();
+    msg.style.display='block';msg.style.background='#450a0a';msg.style.color='#ef4444';msg.style.border='1px solid #991b1b';
+    msg.textContent=d.error?.message||'Login failed';
+  }catch(e){msg.style.display='block';msg.style.background='#450a0a';msg.style.color='#ef4444';msg.style.border='1px solid #991b1b';msg.textContent='Network error'}
+  finally{btn.disabled=false}
+}
+
 async function loadStatus(){
   try{
     const r=await fetch('/admin/token/status',{credentials:'include'});
-    if(r.status===401){location.reload();return}
+    if(r.status===401){showInlineLogin();return}
     const d=await r.json();
     const v=d.valid;
     const cls=v?'valid':'invalid';
@@ -812,7 +831,7 @@ async function loadStatus(){
 async function loadChromiumStatus(){
   try{
     const r=await fetch('/admin/chromium/login-status',{credentials:'include'});
-    if(r.status===401){location.reload();return}
+    if(r.status===401){showInlineLogin();return}
     const d=await r.json();
     if(!d.chromium_running){
       document.getElementById('chromium-status').innerHTML='<div class="status-row"><span class="status-label">Chromium</span><span class="status-value invalid">'+t('chromium_not_running')+'</span></div>';
