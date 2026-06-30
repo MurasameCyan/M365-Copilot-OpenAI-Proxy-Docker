@@ -40,8 +40,9 @@ RUN chmod +x /entrypoint.sh
 # Persist Chrome user data (login state)
 VOLUME /chrome-profile
 
-# Token storage volume (persist across restarts, isolated from app code)
-VOLUME /home/app/token
+# NOTE: /home/app/token is managed as tmpfs via docker-compose (not VOLUME here).
+# Declaring VOLUME would conflict with tmpfs, causing Docker to mount a named volume
+# owned by root:root that shadows the tmpfs mount and breaks app-user write access.
 
 # Environment variables (do NOT set M365_ACCESS_TOKEN or ADMIN_PASSWORD here — they may leak into image layers)
 ENV M365_TIME_ZONE="Asia/Shanghai"
