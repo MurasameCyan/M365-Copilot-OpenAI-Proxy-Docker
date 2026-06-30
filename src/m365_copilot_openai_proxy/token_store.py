@@ -135,6 +135,22 @@ def write_token(token: str) -> None:
         pass
 
 
+def write_username(username: str) -> None:
+    """Write username to the token directory for persistence across restarts."""
+    token_dir = _get_token_dir()
+    username_file = token_dir / "username"
+    token_dir.mkdir(parents=True, exist_ok=True)
+    username_file.write_text(username, encoding="utf-8")
+
+
+def read_username() -> str:
+    """Read persisted username from the token directory."""
+    try:
+        return (_get_token_dir() / "username").read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return ""
+
+
 def _read_env_token(path: Path) -> str | None:
     try:
         text = path.read_text(encoding="utf-8")

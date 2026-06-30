@@ -17,7 +17,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Stre
 from .config import Settings
 from .session_store import PersistentSession, PersistentSessionStore
 from .substrate_client import SubstrateCopilotClient, SubstrateCopilotError
-from .token_store import AccessTokenStore, write_token, init_token_dir
+from .token_store import AccessTokenStore, write_token, write_username, read_username, init_token_dir
 from .models import AnthropicMessagesRequest, OpenAIChatRequest, OpenAIResponsesRequest
 from .translator import translate_anthropic_request, translate_openai_request, translate_responses_request
 
@@ -38,7 +38,7 @@ def create_app(
     app.state.auto_refresh_enabled = False  # On-demand: only refresh when /v1/ requests come in
     app.state.last_request_time = 0  # 0 means never received any /v1/ request
     app.state.idle_timeout_minutes = resolved_settings.idle_timeout_minutes
-    app.state.username = ""  # Set via get_token.js push or CDP extraction
+    app.state.username = read_username()  # Restore persisted username (set via get_token.js push or CDP extraction)
     if not resolved_settings.api_key:
         print("WARNING: API_KEY is not set. All /v1/ API endpoints are open without authentication. Set API_KEY in .env to secure your instance.")
     _admin_secret = resolved_settings.admin_password or resolved_settings.api_key
@@ -226,6 +226,7 @@ def create_app(
         app.state.token_store._mtime_ns = None
         if username:
             app.state.username = username
+            write_username(username)
         return {"status": "ok", "message": "Token updated", "token_status": app.state.token_store.status()}
 
     @app.post("/admin/token/auto-capture")
@@ -356,7 +357,7 @@ def create_app(
         page_title = tab.get("title", "")
         page_url = tab.get("url", "")
         cookie_details = []
-        # Extract username: prefer app.state.username (set by get_token.js push)
+        # Extract username: prefer CDP extraction, fallback to app.state.username (set by get_token.js push)
         username = getattr(app.state, 'username', '') or None
         try:
             async with _ws.connect(tab["webSocketDebuggerUrl"]) as ws:
@@ -406,11 +407,17 @@ def create_app(
                                 name_val = msg.get("result", {}).get("result", {}).get("value")
                                 if name_val and isinstance(name_val, str):
                                     username = name_val.strip()
+                                    app.state.username = username
+                                    write_username(username)
                                 break
                     except Exception:
                         pass
         except Exception:
             logged_in = "m365.cloud.microsoft/chat" in page_url
+
+        # Fallback to persisted username if CDP extraction returned nothing
+        if not username:
+            username = getattr(app.state, 'username', '') or None
 
         return {
             "chromium_running": True,
@@ -473,6 +480,8 @@ def create_app(
         except Exception as exc:
             return _json_err(502, f"CDP logout failed: {exc}")
 
+        app.state.username = ""
+        write_username("")
         return {"status": "ok", "message": f"Logged out. Cleared {cleared}/{len(cookies)} cookies.", "username": ""}
 
     @app.post("/admin/login")
