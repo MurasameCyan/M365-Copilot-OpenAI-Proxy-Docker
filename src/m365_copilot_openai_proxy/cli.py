@@ -18,7 +18,7 @@ import uvicorn
 import websockets
 
 from .app import create_app
-from .token_store import decode_jwt_payload, is_substrate_token_claims, read_token as read_token_from_store, write_token as write_token_to_store
+from .token_store import decode_jwt_payload, is_substrate_token_claims, read_token as read_token_from_store, write_token as write_token_to_store, write_username, read_username
 
 
 class _SuppressCtrlC(logging.Filter):
@@ -371,6 +371,20 @@ def _auto_refresh_loop(
 
 def _write_token(token: str) -> None:
     write_token_to_store(token)
+    # Also extract and persist username from JWT if not already set
+    existing = read_username()
+    if not existing or len(existing) <= 1:
+        try:
+            claims = decode_jwt_payload(token)
+            name = claims.get("name") or claims.get("upn") or ""
+            if isinstance(name, str):
+                name = name.strip()
+                if "@" in name and " " not in name:
+                    name = name.split("@")[0]
+            if name and len(name) > 1:
+                write_username(name)
+        except Exception:
+            pass
 
 
 def main() -> None:

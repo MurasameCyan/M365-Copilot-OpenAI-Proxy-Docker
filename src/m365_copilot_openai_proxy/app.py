@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 import os
 import re
 import secrets
@@ -17,12 +18,69 @@ from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Stre
 from .config import Settings
 from .session_store import PersistentSession, PersistentSessionStore
 from .substrate_client import SubstrateCopilotClient, SubstrateCopilotError
-from .token_store import AccessTokenStore, write_token, write_username, read_username, init_token_dir
+from .token_store import AccessTokenStore, write_token, write_username, read_username, decode_jwt_payload, init_token_dir
 from .models import AnthropicMessagesRequest, OpenAIChatRequest, OpenAIResponsesRequest
 from .translator import translate_anthropic_request, translate_openai_request, translate_responses_request
 
 _PERSIST_MODEL_SUFFIX = ":persist"
 _SESSION_ID_HEADER = "x-m365-session-id"
+
+import re as _re
+
+_TOOL_CALL_RE = _re.compile(
+    r"```tool_call\s*\n(.*?)\n\s*```",
+    _re.DOTALL,
+)
+
+
+def _extract_tool_calls(text: str) -> list[dict]:
+    """Parse tool_call JSON blocks from model text output into OpenAI tool_calls format."""
+    calls = []
+    for i, m in enumerate(_TOOL_CALL_RE.finditer(text)):
+        raw = m.group(1).strip()
+        try:
+            obj = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        name = obj.get("name", "")
+        arguments = obj.get("arguments", obj)
+        if isinstance(arguments, dict):
+            arguments = json.dumps(arguments, ensure_ascii=False)
+        elif not isinstance(arguments, str):
+            arguments = str(arguments)
+        calls.append({
+            "id": f"call_{uuid.uuid4().hex[:24]}",
+            "type": "function",
+            "function": {
+                "name": name,
+                "arguments": arguments,
+            },
+        })
+    return calls
+
+
+def _strip_tool_call_blocks(text: str) -> str:
+    """Remove tool_call code blocks from text, keeping surrounding content."""
+    return _TOOL_CALL_RE.sub("", text).strip()
+
+
+def _update_username_from_token(token: str, state) -> None:
+    """Extract username from JWT claims and persist it if not already set."""
+    if getattr(state, 'username', None) and len(state.username) > 1:
+        return  # Already have a valid username, keep it
+    try:
+        claims = decode_jwt_payload(token)
+        name = claims.get("name") or claims.get("upn") or ""
+        if isinstance(name, str):
+            name = name.strip()
+            # If upn is email, take the local part
+            if "@" in name and " " not in name:
+                name = name.split("@")[0]
+        if name and len(name) > 1:
+            state.username = name
+            write_username(name)
+    except Exception:
+        pass
 
 
 def create_app(
@@ -35,6 +93,7 @@ def create_app(
     app.state.settings = resolved_settings
     app.state.token_store = AccessTokenStore(resolved_settings.access_token)
     app.state.session_store = PersistentSessionStore()
+    app.state.call_log: list[dict] = []  # API call log for web UI display
     app.state.auto_refresh_enabled = False  # On-demand: only refresh when /v1/ requests come in
     app.state.last_request_time = 0  # 0 means never received any /v1/ request
     app.state.idle_timeout_minutes = resolved_settings.idle_timeout_minutes
@@ -139,7 +198,7 @@ def create_app(
         if not resolved_settings.api_key:
             return await call_next(request)
         # Skip auth for admin page (has its own cookie check) and health endpoints
-        if path in ("/", "/favicon.ico", "/healthz", "/admin/login", "/admin/token/status", "/admin/token/update", "/admin/token/auto-capture", "/admin/token/auto-refresh-toggle", "/admin/cookie/inject", "/admin/chromium/login-status", "/admin/chromium/logout"):
+        if path in ("/", "/favicon.ico", "/healthz", "/admin/login", "/admin/token/status", "/admin/token/update", "/admin/token/auto-capture", "/admin/token/auto-refresh-toggle", "/admin/cookie/inject", "/admin/chromium/login-status", "/admin/chromium/logout", "/admin/call-log"):
             return await call_next(request)
         auth = request.headers.get("Authorization", "")
         match = re.match(r"^Bearer\s+(.+)$", auth, re.IGNORECASE)
@@ -227,6 +286,8 @@ def create_app(
         if username and len(username) > 1:
             app.state.username = username
             write_username(username)
+        else:
+            _update_username_from_token(token, app.state)
         return {"status": "ok", "message": "Token updated", "token_status": app.state.token_store.status()}
 
     @app.post("/admin/token/auto-capture")
@@ -247,6 +308,7 @@ def create_app(
         write_token(token)
         app.state.token_store._token = token
         app.state.token_store._mtime_ns = None
+        _update_username_from_token(token, app.state)
         return {"status": "ok", "message": "Token auto-captured", "token_status": app.state.token_store.status()}
 
     @app.post("/admin/cookie/inject")
@@ -255,6 +317,10 @@ def create_app(
         if err: return err
         body = await request.json()
         cookies = body.get("cookies", [])
+        username = body.get("username", "")
+        if username and len(str(username).strip()) > 1:
+            app.state.username = str(username).strip()
+            write_username(str(username).strip())
         if not cookies:
             return _json_err(400, "No cookies provided")
         import asyncio as _async
@@ -520,6 +586,12 @@ def create_app(
         _login_failures.setdefault(client_ip, []).append(now)
         return JSONResponse({"error": {"message": "Wrong password", "type": "auth_error"}}, status_code=401)
 
+    @app.get("/admin/call-log")
+    async def get_call_log(request: Request) -> dict:
+        err = _require_admin(request)
+        if err: return err
+        return {"logs": getattr(app.state, 'call_log', [])}
+
     @app.get("/", response_class=HTMLResponse)
     async def admin_page(request: Request) -> str:
         if _admin_secret and not _is_admin_authenticated(request):
@@ -551,10 +623,38 @@ def create_app(
         settings: Settings = Depends(get_settings),
         client: SubstrateCopilotClient = Depends(get_copilot_client),
     ):
+        _log = logging.getLogger("copilot_proxy")
+        _log.info("[/v1/chat/completions] stream=%s tools=%d messages=%d model=%s",
+                  request.stream, len(request.tools) if request.tools else 0,
+                  len(request.messages), request.model)
+        if request.tools:
+            for t in request.tools:
+                _log.info("  tool: %s", t.function.name if t.function else "?")
+        # Record call for web UI
+        call_record = {
+            "time": time.strftime("%H:%M:%S"),
+            "stream": request.stream,
+            "tools": [t.function.name for t in request.tools] if request.tools else [],
+            "messages": len(request.messages),
+            "model": request.model,
+            "tool_calls_result": None,
+        }
         try:
             translated = translate_openai_request(request)
             session = _persistent_session(app, raw_request, request.model, request.user)
             if request.stream:
+                if request.tools:
+                    # When tools are present, buffer the full stream then parse tool_calls
+                    return StreamingResponse(
+                        _openai_stream_with_tools(
+                            settings.model_alias,
+                            client,
+                            translated.prompt,
+                            translated.additional_context,
+                            session,
+                        ),
+                        media_type="text/event-stream",
+                    )
                 return StreamingResponse(
                     _openai_stream(
                         settings.model_alias,
@@ -571,6 +671,35 @@ def create_app(
         except SubstrateCopilotError as exc:
             raise HTTPException(status_code=502, detail=str(exc)) from exc
 
+        # If request included tools, parse model output for tool_call blocks
+        tool_calls = _extract_tool_calls(text) if request.tools else []
+        _log.info("[/v1/chat/completions] response len=%d tool_calls=%d", len(text), len(tool_calls))
+        if tool_calls:
+            _log.info("  parsed tool_calls: %s", [tc["function"]["name"] for tc in tool_calls])
+        # Save call record
+        call_record["response_len"] = len(text)
+        call_record["tool_calls_result"] = [tc["function"]["name"] for tc in tool_calls] if tool_calls else []
+        app.state.call_log.append(call_record)
+        if len(app.state.call_log) > 100:
+            app.state.call_log = app.state.call_log[-100:]
+        if tool_calls:
+            remaining = _strip_tool_call_blocks(text)
+            msg = {"role": "assistant", "content": remaining or None, "tool_calls": tool_calls}
+            return JSONResponse({
+                "id": f"chatcmpl_{uuid.uuid4().hex}",
+                "object": "chat.completion",
+                "created": int(time.time()),
+                "model": settings.model_alias,
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": msg,
+                        "finish_reason": "tool_calls",
+                    }
+                ],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            })
+
         return JSONResponse({
             "id": f"chatcmpl_{uuid.uuid4().hex}",
             "object": "chat.completion",
@@ -583,6 +712,7 @@ def create_app(
                     "finish_reason": "stop",
                 }
             ],
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
         })
 
     @app.post("/v1/responses")
@@ -716,6 +846,49 @@ async def _openai_stream(
     }
     yield f"data: {json.dumps(final_chunk)}\n\n"
     yield "data: [DONE]\n\n"
+
+
+async def _openai_stream_with_tools(
+    model_alias: str,
+    client: SubstrateCopilotClient,
+    prompt: str,
+    additional_context: list[str],
+    session: PersistentSession | None = None,
+) -> AsyncIterator[str]:
+    """Buffer full stream, then emit as tool_calls if found, else normal content stream."""
+    _log = logging.getLogger("copilot_proxy")
+    chunks: list[str] = []
+    async for delta in client.chat_stream(prompt, additional_context, session):
+        chunks.append(delta)
+    full_text = "".join(chunks)
+
+    tool_calls = _extract_tool_calls(full_text)
+    _log.info("[stream_with_tools] full_text len=%d tool_calls=%d", len(full_text), len(tool_calls))
+    if tool_calls:
+        _log.info("  parsed tool_calls: %s", [tc["function"]["name"] for tc in tool_calls])
+    completion_id = f"chatcmpl_{uuid.uuid4().hex}"
+    created = int(time.time())
+
+    if tool_calls:
+        remaining = _strip_tool_call_blocks(full_text)
+        # Emit role chunk
+        yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
+        # Emit remaining text content if any
+        if remaining:
+            yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {'content': remaining}, 'finish_reason': None}]})}\n\n"
+        # Emit tool_calls chunks — one per tool call
+        for i, tc in enumerate(tool_calls):
+            delta_tc = [{"index": i, "id": tc["id"], "type": "function", "function": {"name": tc["function"]["name"], "arguments": tc["function"]["arguments"]}}]
+            yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {'tool_calls': delta_tc}, 'finish_reason': None}]})}\n\n"
+        # Final chunk with finish_reason
+        yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'tool_calls'}]})}\n\n"
+        yield "data: [DONE]\n\n"
+    else:
+        # No tool calls found — re-stream as normal content
+        yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {'role': 'assistant'}, 'finish_reason': None}]})}\n\n"
+        yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {'content': full_text}, 'finish_reason': None}]})}\n\n"
+        yield f"data: {json.dumps({'id': completion_id, 'object': 'chat.completion.chunk', 'created': created, 'model': model_alias, 'choices': [{'index': 0, 'delta': {}, 'finish_reason': 'stop'}]})}\n\n"
+        yield "data: [DONE]\n\n"
 
 
 async def _responses_stream(
@@ -915,6 +1088,19 @@ POST /v1/messages
 </div>
 </div>
 
+<div class="card">
+<details id="call-log-details" style="cursor:pointer">
+<summary style="font-size:1.1rem;font-weight:600;color:#e2e8f0;list-style:none;display:flex;align-items:center;gap:.5rem">
+<span data-i18n="title_call_log">API 调用记录</span>
+<span id="call-log-count" style="font-size:.75rem;color:#64748b;background:#1e293b;padding:2px 8px;border-radius:8px">0</span>
+<span style="font-size:.7rem;color:#475569;margin-left:auto" data-i18n="click_expand">点击展开</span>
+</summary>
+<div id="call-log-content" style="margin-top:.75rem;max-height:400px;overflow-y:auto;font-family:monospace;font-size:.8rem">
+<span style="color:#64748b" data-i18n="no_calls_yet">暂无调用记录</span>
+</div>
+</details>
+</div>
+
 <script>
 const i18n={
   zh:{
@@ -939,6 +1125,10 @@ const i18n={
     auto_refresh_stopped:'自动刷新已停止',auto_refresh_started:'自动刷新已启动',
     auto_refresh_label:'自动刷新',
     username_label:'用户名',
+    title_call_log:'API 调用记录',
+    click_expand:'点击展开',
+    no_calls_yet:'暂无调用记录',
+    tool_calls_parsed:'解析出工具调用',
   },
   en:{
     title_update_token:'Update Token',btn_update:'Update Token',btn_check_login:'Check Login',btn_auto_capture:'Auto Capture',
@@ -962,6 +1152,10 @@ const i18n={
     auto_refresh_stopped:'Auto refresh stopped',auto_refresh_started:'Auto refresh started',
     auto_refresh_label:'Auto Refresh',
     username_label:'Username',
+    title_call_log:'API Call Log',
+    click_expand:'Click to expand',
+    no_calls_yet:'No calls yet',
+    tool_calls_parsed:'Parsed tool calls',
   }
 };
 let lang=localStorage.getItem('lang')||'zh';
@@ -1036,9 +1230,10 @@ async function loadStatus(){
       '<div class="status-row"><span class="status-label">'+t('valid')+'</span><span class="status-value '+cls+'">'+(v?t('status_yes'):t('status_no'))+'</span></div>'+
       (d.username?'<div class="status-row"><span class="status-label">'+t('username_label')+'</span><span class="status-value valid">'+d.username+'</span></div>':'')+
       '<div class="status-row"><span class="status-label">'+t('expires')+'</span><span class="status-value '+(v&&d.seconds_remaining<600?'warn':'')+'">'+exp+'</span></div>'+
-      '<div class="status-row"><span class="status-label">'+t('remaining')+'</span><span class="status-value '+(v&&d.seconds_remaining<600?'warn':'')+'">'+fmtSec(d.seconds_remaining)+'</span></div>'+
+      '<div class="status-row"><span class="status-label">'+t('remaining')+'</span><span class="status-value '+(v&&d.seconds_remaining<600?'warn':'')+'"><span id="remaining-sec">'+fmtSec(d.seconds_remaining)+'</span></span></div>'+
       '<div class="status-row"><span class="status-label">'+t('auto_refresh_label')+'</span><span class="status-value '+(d.auto_refresh?'valid':'warn')+'">'+(d.auto_refresh?t('status_yes'):t('status_no'))+'</span></div>'+
       (d.error?'<div class="status-row"><span class="status-label">'+t('error')+'</span><span class="status-value invalid">'+d.error+'</span></div>':'');
+    startCountdown(d.seconds_remaining||0);
     updateRefreshBtn(d.auto_refresh);
   }catch(e){
     document.getElementById('status-content').innerHTML='<span class="invalid">Failed to load</span>';
@@ -1179,8 +1374,49 @@ async function logoutUser(){
 
 loadStatus();
 loadChromiumStatus();
+loadCallLog();
 setInterval(loadStatus,60000);
 setInterval(loadChromiumStatus,60000);
+setInterval(loadCallLog,5000);
+
+// Client-side countdown timer
+let _countdownSec=0;
+let _countdownTick=0;
+function startCountdown(sec){_countdownSec=sec;_countdownTick=0}
+function tickCountdown(){
+  if(_countdownSec<=0)return;
+  _countdownSec--;_countdownTick++;
+  const el=document.getElementById('remaining-sec');
+  if(el)el.textContent=fmtSec(_countdownSec);
+}
+setInterval(tickCountdown,1000);
+
+async function loadCallLog(){
+  try{
+    const r=await fetch('/admin/call-log',{credentials:'include'});
+    if(r.status===401){showInlineLogin();return}
+    const d=await r.json();
+    const logs=d.logs||[];
+    document.getElementById('call-log-count').textContent=logs.length;
+    const el=document.getElementById('call-log-content');
+    if(!logs.length){el.innerHTML='<span style="color:#64748b">'+t('no_calls_yet')+'</span>';return}
+    let html='';
+    for(let i=logs.length-1;i>=0;i--){
+      const l=logs[i];
+      const tc=l.tools&&l.tools.length?l.tools.join(', '):'—';
+      const tr=l.tool_calls_result&&l.tool_calls_result.length?
+        '<span style="color:#22c55e">'+t('tool_calls_parsed')+': '+l.tool_calls_result.join(', ')+'</span>':'';
+      html+='<div style="border-bottom:1px solid #1e293b;padding:6px 0">'+
+        '<div style="display:flex;justify-content:space-between;color:#94a3b8">'+
+        '<span>'+l.time+'</span><span style="color:#475569">'+(l.stream?'stream':'sync')+'</span></div>'+
+        '<div style="color:#e2e8f0;margin-top:2px">tools: <span style="color:#38bdf8">'+tc+'</span></div>'+
+        (tr?'<div style="margin-top:2px">'+tr+'</div>':'')+
+        (l.response_len?'<div style="color:#475569;margin-top:2px">resp: '+l.response_len+' chars</div>':'')+
+        '</div>';
+    }
+    el.innerHTML=html;
+  }catch(e){}
+}
 </script>
 </body>
 </html>"""

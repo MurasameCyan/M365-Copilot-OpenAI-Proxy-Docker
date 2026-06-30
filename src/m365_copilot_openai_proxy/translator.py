@@ -45,10 +45,30 @@ def _format_tools_prompt(tools) -> str | None:
                 desc += "\n  Parameters:\n" + "\n".join(param_parts)
         tool_descriptions.append(desc)
     return (
-        "You have access to the following tools. When you need to use a tool, "
-        "output the tool call as a JSON code block with the format:\n"
+        "IMPORTANT: You have access to tools that can read, write, and edit files on the user's local machine. "
+        "You MUST use these tools to perform file operations — do NOT just describe what you would do or say you cannot access files. "
+        "The tools are REAL and FUNCTIONAL. You CAN and SHOULD use them directly.\n\n"
+        "To call a tool, output a JSON code block with the EXACT format:\n"
         "```tool_call\n"
         '{"name": "<tool_name>", "arguments": {<key-value pairs>}}\n'
+        "```\n\n"
+        "CRITICAL RULES:\n"
+        "- When asked to read a file, you MUST call the Read tool — do NOT say you cannot access it.\n"
+        "- When asked to create/write a file, you MUST call the Write tool — do NOT just output the content in a code block.\n"
+        "- When asked to edit a file, you MUST call the Edit tool — do NOT just show the changes.\n"
+        "- ALWAYS call tools for file operations. NEVER claim you 'cannot access local files' or 'are in a sandbox'.\n\n"
+        "Examples:\n"
+        "To read a file:\n"
+        "```tool_call\n"
+        '{"name": "Read", "arguments": {"file_path": "/path/to/file"}}\n'
+        "```\n\n"
+        "To write a file:\n"
+        "```tool_call\n"
+        '{"name": "Write", "arguments": {"file_path": "/path/to/file", "content": "file content here"}}\n'
+        "```\n\n"
+        "To edit a file:\n"
+        "```tool_call\n"
+        '{"name": "Edit", "arguments": {"file_path": "/path/to/file", "old_string": "text to replace", "new_string": "replacement text"}}\n'
         "```\n\n"
         "Available tools:\n" + "\n".join(tool_descriptions)
     )

@@ -232,7 +232,7 @@
             const r = await gmFetch(base + '/admin/cookie/inject', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ cookies })
+                body: JSON.stringify({ cookies, username: getUsername() || undefined })
             });
             const d = await r.json();
             alert(r.ok ? `Cookies pushed! ${d.message}\n(httpOnly included: ${cookies.filter(c => c.httpOnly).length})` : `Failed: ${d.error?.message || d.error}`);
@@ -268,7 +268,7 @@
                     await gmFetch(base + '/admin/cookie/inject', {
                         method: 'POST',
                         headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ cookies })
+                        body: JSON.stringify({ cookies, username: getUsername() || undefined })
                     });
                     // Wait for Chromium to process cookies and reload
                     await new Promise(r => setTimeout(r, 3000));
