@@ -91,7 +91,7 @@ def _format_tool_results(tool_calls: list[ToolCall] | None, content: str, name: 
     return "\n".join(parts)
 
 
-def translate_openai_request(request: OpenAIChatRequest) -> TranslatedRequest:
+def translate_openai_request(request: OpenAIChatRequest, incremental: bool = False) -> TranslatedRequest:
     system_lines: list[str] = []
     transcript_lines: list[str] = []
     prompt = ""
@@ -101,8 +101,27 @@ def translate_openai_request(request: OpenAIChatRequest) -> TranslatedRequest:
     if tools_prompt:
         system_lines.append(tools_prompt)
 
+    # In incremental (persistent-session continuation) mode, the M365 server already
+    # remembers everything up to and including its last assistant response. Only the
+    # content AFTER the last assistant message is new (the latest user turn plus any
+    # locally-executed tool results). We drop older transcript lines to avoid resending
+    # the whole history each turn. System/tool instructions are always kept.
+    last_assistant_index = -1
+    if incremental:
+        for i, m in enumerate(request.messages):
+            if m.role == "assistant":
+                last_assistant_index = i
+
     for index, message in enumerate(request.messages):
         is_last = index == len(request.messages) - 1
+        # Skip already-seen transcript content in incremental mode (but never skip the
+        # last message, which becomes the prompt, nor system/developer instructions).
+        skip_transcript = (
+            incremental
+            and index <= last_assistant_index
+            and not is_last
+            and message.role not in {"system", "developer"}
+        )
 
         # Handle tool result messages
         if message.role == "tool":
@@ -112,7 +131,8 @@ def translate_openai_request(request: OpenAIChatRequest) -> TranslatedRequest:
                 message.name,
                 message.tool_call_id,
             )
-            transcript_lines.append(f"Tool: {text}")
+            if not skip_transcript:
+                transcript_lines.append(f"Tool: {text}")
             # If this tool result is the last message (agentic loop: the host executed
             # a tool and sent the result back with no trailing user turn), synthesize a
             # continuation prompt so the model keeps going instead of erroring out.
@@ -137,7 +157,8 @@ def translate_openai_request(request: OpenAIChatRequest) -> TranslatedRequest:
                     tool_call_texts.append(f"Assistant called tool: {tc.function.name}({tc.function.arguments})")
             if text:
                 tool_call_texts.insert(0, f"Assistant: {text}")
-            transcript_lines.append("\n".join(tool_call_texts))
+            if not skip_transcript:
+                transcript_lines.append("\n".join(tool_call_texts))
             if is_last:
                 prompt = (
                     "Continue the task based on the conversation above. If more actions "
@@ -155,7 +176,8 @@ def translate_openai_request(request: OpenAIChatRequest) -> TranslatedRequest:
                 raise ValueError("The final OpenAI message must be a user message.")
             prompt = text
             continue
-        transcript_lines.append(f"{message.role.capitalize()}: {text}")
+        if not skip_transcript:
+            transcript_lines.append(f"{message.role.capitalize()}: {text}")
 
     if not prompt:
         raise ValueError("A final user message is required.")

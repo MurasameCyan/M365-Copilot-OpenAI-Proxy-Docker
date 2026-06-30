@@ -20,7 +20,7 @@ from .session_store import PersistentSession, PersistentSessionStore
 from .substrate_client import SubstrateCopilotClient, SubstrateCopilotError
 from .token_store import AccessTokenStore, write_token, write_username, read_username, decode_jwt_payload, init_token_dir
 from .models import AnthropicMessagesRequest, OpenAIChatRequest, OpenAIResponsesRequest
-from .translator import translate_anthropic_request, translate_openai_request, translate_responses_request
+from .translator import translate_anthropic_request, translate_openai_request, translate_responses_request, flatten_content
 
 _PERSIST_MODEL_SUFFIX = ":persist"
 _SESSION_ID_HEADER = "x-m365-session-id"
@@ -797,7 +797,12 @@ def create_app(
                     "id": settings.model_alias,
                     "object": "model",
                     "owned_by": "microsoft-365-copilot",
-                }
+                },
+                {
+                    "id": f"{settings.model_alias}{_PERSIST_MODEL_SUFFIX}",
+                    "object": "model",
+                    "owned_by": "microsoft-365-copilot",
+                },
             ],
         }
 
@@ -825,8 +830,15 @@ def create_app(
             "tool_calls_result": None,
         }
         try:
-            translated = translate_openai_request(request)
-            session = _persistent_session(app, raw_request, request.model, request.user)
+            session = _persistent_session(app, raw_request, request.model, request.user, request)
+            # In explicit persist mode, once the M365 session already has history,
+            # only send the incremental turn (the server remembers the rest).
+            incremental = (
+                request.model.endswith(_PERSIST_MODEL_SUFFIX)
+                and session is not None
+                and session.turn_count > 0
+            )
+            translated = translate_openai_request(request, incremental=incremental)
             if request.stream:
                 # Save call record for streaming (tool_calls_result resolved later)
                 call_record["streaming"] = True
@@ -998,12 +1010,20 @@ def _persistent_session(
     raw_request: Request,
     model: str,
     fallback_key: str | None = None,
+    request: OpenAIChatRequest | None = None,
 ) -> PersistentSession | None:
     header_key = (raw_request.headers.get(_SESSION_ID_HEADER) or "").strip()
     if header_key:
         return app.state.session_store.get(f"header:{header_key}")
     if model.endswith(_PERSIST_MODEL_SUFFIX):
         return app.state.session_store.get(f"model:{fallback_key or 'default'}")
+    # Auto-detect conversation from the request messages so that all turns of the
+    # same Trae conversation reuse one M365 Copilot session (instead of creating a
+    # brand-new chat record on every request). A new Trae conversation has a
+    # different first user message -> different session key -> new M365 session.
+    if request is not None:
+        sid, _title = _detect_conversation_session(request)
+        return app.state.session_store.get(f"auto:{sid}")
     return None
 
 
