@@ -104,39 +104,130 @@ def _extract_tool_calls(text: str) -> list[dict]:
 
 
 # Prose fallback: model writes "save as `<path>`" then a fenced code block,
-# instead of emitting a tool_call. Detect a file path (with extension) followed
-# by the first fenced code block, and synthesize a Write tool_call.
+# instead of emitting a tool_call. Synthesize a Write tool_call ONLY when the
+# code block's language tag matches the target file's extension — this avoids
+# mistaking a usage example (e.g. ```bash python foo.py```) for the file content.
 _PROSE_PATH_RE = _re.compile(
     r"`([A-Za-z]:[\\/][^`\n]+?\.[A-Za-z0-9]{1,8}|/[^`\n]+?\.[A-Za-z0-9]{1,8})`"
 )
-_PROSE_CODE_RE = _re.compile(r"```[A-Za-z0-9_+\-]*\s*\n(.*?)```", _re.DOTALL)
+# Capture the language tag (group 1) and the body (group 2).
+_PROSE_CODE_RE = _re.compile(r"```([A-Za-z0-9_+#.\-]*)[ \t]*\n(.*?)```", _re.DOTALL)
+
+# Map a file extension to the set of fenced-code-block language tags that count
+# as matching content for that extension.
+_EXT_LANG = {
+    "py": {"python", "py", "python3"},
+    "pyw": {"python", "py"},
+    "bat": {"bat", "batch", "cmd", "dos", "bat文件"},
+    "cmd": {"bat", "batch", "cmd", "dos"},
+    "sh": {"bash", "sh", "shell", "zsh"},
+    "bash": {"bash", "sh", "shell"},
+    "ps1": {"powershell", "ps1", "pwsh", "posh"},
+    "js": {"javascript", "js", "node", "jsx"},
+    "mjs": {"javascript", "js", "node"},
+    "cjs": {"javascript", "js", "node"},
+    "ts": {"typescript", "ts", "tsx"},
+    "tsx": {"typescript", "tsx", "ts"},
+    "jsx": {"javascript", "jsx", "js"},
+    "json": {"json", "json5", "jsonc"},
+    "html": {"html", "htm", "xhtml"},
+    "htm": {"html", "htm"},
+    "css": {"css"},
+    "scss": {"scss", "sass", "css"},
+    "less": {"less", "css"},
+    "java": {"java"},
+    "kt": {"kotlin", "kt"},
+    "c": {"c"},
+    "h": {"c", "cpp", "c++"},
+    "cpp": {"cpp", "c++", "cxx", "cc"},
+    "cc": {"cpp", "c++", "cc"},
+    "cs": {"csharp", "cs", "c#"},
+    "go": {"go", "golang"},
+    "rs": {"rust", "rs"},
+    "rb": {"ruby", "rb"},
+    "php": {"php"},
+    "swift": {"swift"},
+    "yml": {"yaml", "yml"},
+    "yaml": {"yaml", "yml"},
+    "xml": {"xml"},
+    "sql": {"sql"},
+    "md": {"markdown", "md"},
+    "txt": {"text", "txt", "plaintext", ""},
+    "toml": {"toml"},
+    "ini": {"ini", "cfg", "conf"},
+    "cfg": {"ini", "cfg", "conf"},
+    "conf": {"ini", "cfg", "conf"},
+    "env": {"dotenv", "env", "bash", "sh", ""},
+    "dockerfile": {"dockerfile", "docker"},
+    "vue": {"vue", "html"},
+    "r": {"r"},
+    "lua": {"lua"},
+    "pl": {"perl", "pl"},
+    "scala": {"scala"},
+    "dart": {"dart"},
+    "gradle": {"gradle", "groovy"},
+    "groovy": {"groovy"},
+    "makefile": {"makefile", "make"},
+}
 
 
 def _extract_prose_write(text: str, tool_names: set[str]) -> list[dict]:
     """Fallback: synthesize a Write tool_call from a 'save as <path>' + code block prose.
 
-    Only triggers when a Write-like tool is available and the model produced a file
-    path (with extension) followed by a fenced code block.
+    Strict matching to avoid corrupting files:
+    - A Write-like tool must be available.
+    - A LOCAL file path (drive letter or absolute unix path, not a URL) with an
+      extension must be present.
+    - A fenced code block whose language tag matches the file's extension must
+      exist. This prevents usage-example blocks (```bash, ```text) from being
+      mistaken for the file content and overwriting a correctly written file.
     """
     if not any(n.lower() == "write" for n in tool_names):
         return []
-    path_m = _PROSE_PATH_RE.search(text)
-    if not path_m:
+
+    # Collect candidate local paths (skip URLs).
+    file_path = None
+    target_ext = None
+    for path_m in _PROSE_PATH_RE.finditer(text):
+        candidate = path_m.group(1).strip()
+        if "://" in candidate or candidate.lower().startswith("http"):
+            continue
+        ext = candidate.rsplit(".", 1)[-1].lower() if "." in candidate else ""
+        if not ext:
+            continue
+        file_path = candidate
+        target_ext = ext
+        break
+    if not file_path or not target_ext:
         return []
-    file_path = path_m.group(1).strip()
-    # First fenced code block that appears after the path mention
-    code_m = _PROSE_CODE_RE.search(text, path_m.end())
-    if not code_m:
-        # Try a code block before the path as a fallback
-        code_m = _PROSE_CODE_RE.search(text)
-        if not code_m:
-            return []
-    content = code_m.group(1)
-    # Trim a single trailing newline that fenced blocks usually carry
-    if content.endswith("\n"):
-        content = content[:-1]
+
+    allowed_langs = _EXT_LANG.get(target_ext)
+
+    # Find a code block whose language matches the target extension.
+    best_content = None
+    for code_m in _PROSE_CODE_RE.finditer(text):
+        lang = (code_m.group(1) or "").strip().lower()
+        body = code_m.group(2)
+        if allowed_langs is not None:
+            if lang in allowed_langs:
+                best_content = body
+                break
+        else:
+            # Unknown extension: only accept an exactly-matching language tag.
+            if lang == target_ext:
+                best_content = body
+                break
+    if best_content is None:
+        return []
+
+    # Trim a single trailing newline that fenced blocks usually carry.
+    if best_content.endswith("\n"):
+        best_content = best_content[:-1]
+    if not best_content.strip():
+        return []
+
     write_name = next((n for n in tool_names if n.lower() == "write"), "Write")
-    arguments = json.dumps({"file_path": file_path, "content": content}, ensure_ascii=False)
+    arguments = json.dumps({"file_path": file_path, "content": best_content}, ensure_ascii=False)
     return [{
         "id": f"call_{uuid.uuid4().hex[:24]}",
         "type": "function",
