@@ -28,12 +28,14 @@ _SESSION_ID_HEADER = "x-m365-session-id"
 import re as _re
 
 # Primary: fenced ```tool_call blocks. Fallback: ```json blocks that look like a tool call.
+# Note: closing/opening newlines are optional — the model often emits the closing ``` right
+# after the JSON (e.g. `}}``` ) with no preceding newline, which would otherwise fail to match.
 _TOOL_CALL_RE = _re.compile(
-    r"```tool_call\s*\n(.*?)\n\s*```",
+    r"```tool_call\s*(\{.*?\})\s*```",
     _re.DOTALL,
 )
 _JSON_BLOCK_RE = _re.compile(
-    r"```(?:json)?\s*\n(\{.*?\})\n\s*```",
+    r"```(?:json)?\s*(\{.*?\})\s*```",
     _re.DOTALL,
 )
 
@@ -1204,6 +1206,7 @@ const i18n={
     no_calls_yet:'暂无调用记录',
     tool_calls_parsed:'解析出工具调用',
     view_raw:'查看原文',
+    copy:'复制',copied:'已复制',
   },
   en:{
     title_update_token:'Update Token',btn_update:'Update Token',btn_check_login:'Check Login',btn_auto_capture:'Auto Capture',
@@ -1232,6 +1235,7 @@ const i18n={
     no_calls_yet:'No calls yet',
     tool_calls_parsed:'Parsed tool calls',
     view_raw:'View raw',
+    copy:'Copy',copied:'Copied',
   }
 };
 let lang=localStorage.getItem('lang')||'zh';
@@ -1467,6 +1471,15 @@ function tickCountdown(){
 }
 setInterval(tickCountdown,1000);
 
+window.__callTexts={};
+function copyCallText(key){
+  const txt=window.__callTexts[key];
+  if(txt==null)return;
+  navigator.clipboard.writeText(txt).then(()=>{
+    const b=document.getElementById('copybtn-'+key);
+    if(b){const o=b.textContent;b.textContent=t('copied');setTimeout(()=>{b.textContent=o},1200)}
+  }).catch(()=>{});
+}
 async function loadCallLog(){
   try{
     const r=await fetch('/admin/call-log',{credentials:'include'});
@@ -1475,7 +1488,12 @@ async function loadCallLog(){
     const logs=d.logs||[];
     document.getElementById('call-log-count').textContent=logs.length;
     const el=document.getElementById('call-log-content');
-    if(!logs.length){el.innerHTML='<span style="color:#64748b">'+t('no_calls_yet')+'</span>';return}
+    if(!logs.length){el.innerHTML='<span style="color:#64748b">'+t('no_calls_yet')+'</span>';window.__callLogSig='';return}
+    // Skip re-render if nothing changed — prevents open <details> from collapsing every 5s
+    const sig=JSON.stringify(logs);
+    if(sig===window.__callLogSig)return;
+    window.__callLogSig=sig;
+    window.__callTexts={};
     let html='';
     for(let i=logs.length-1;i>=0;i--){
       const l=logs[i];
@@ -1483,10 +1501,14 @@ async function loadCallLog(){
       const tc=l.tools&&l.tools.length?l.tools.join(', '):'—';
       const tr=l.tool_calls_result&&l.tool_calls_result.length?
         '<span style="color:#22c55e">'+t('tool_calls_parsed')+': '+l.tool_calls_result.join(', ')+'</span>':'';
+      const reprKey='r'+i, textKey='x'+i;
+      if(l.response_repr!=null)window.__callTexts[reprKey]=l.response_repr;
+      if(l.response_text!=null)window.__callTexts[textKey]=l.response_text;
+      const copyBtn=(key)=>'<button id="copybtn-'+key+'" onclick="copyCallText(\''+key+'\')" style="padding:2px 8px;font-size:.65rem;margin-left:6px">'+t('copy')+'</button>';
       const respView=(l.response_repr||l.response_text)?
         '<details style="margin-top:4px"><summary style="cursor:pointer;color:#64748b;font-size:.75rem;list-style:none">'+t('view_raw')+'</summary>'+
-        (l.response_repr?'<div style="color:#475569;margin-top:4px;font-size:.7rem">repr:</div><pre style="white-space:pre-wrap;word-break:break-all;background:#0f172a;padding:6px;border-radius:6px;color:#94a3b8;margin-top:2px;font-size:.7rem;max-height:200px;overflow:auto">'+esc(l.response_repr)+'</pre>':'')+
-        (l.response_text?'<div style="color:#475569;margin-top:4px;font-size:.7rem">text:</div><pre style="white-space:pre-wrap;word-break:break-all;background:#0f172a;padding:6px;border-radius:6px;color:#e2e8f0;margin-top:2px;font-size:.7rem;max-height:300px;overflow:auto">'+esc(l.response_text)+'</pre>':'')+
+        (l.response_repr?'<div style="display:flex;align-items:center;color:#475569;margin-top:4px;font-size:.7rem">repr:'+copyBtn(reprKey)+'</div><pre style="white-space:pre-wrap;word-break:break-all;background:#0f172a;padding:6px;border-radius:6px;color:#94a3b8;margin-top:2px;font-size:.7rem;max-height:200px;overflow:auto">'+esc(l.response_repr)+'</pre>':'')+
+        (l.response_text?'<div style="display:flex;align-items:center;color:#475569;margin-top:4px;font-size:.7rem">text:'+copyBtn(textKey)+'</div><pre style="white-space:pre-wrap;word-break:break-all;background:#0f172a;padding:6px;border-radius:6px;color:#e2e8f0;margin-top:2px;font-size:.7rem;max-height:300px;overflow:auto">'+esc(l.response_text)+'</pre>':'')+
         '</details>':'';
       html+='<div style="border-bottom:1px solid #1e293b;padding:6px 0">'+
         '<div style="display:flex;justify-content:space-between;color:#94a3b8">'+
