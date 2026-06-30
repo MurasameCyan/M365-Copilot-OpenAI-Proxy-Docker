@@ -106,7 +106,7 @@ _auto_refresh_loop → 检查 auto_refresh_enabled → 检查空闲时间
 | `M365_ACCESS_TOKEN`      | 否   | —                  | Substrate Token，留空则由 Chromium 自动捕获 |
 | `M365_TIME_ZONE`         | 否   | `Asia/Shanghai`   | 发送给 Copilot 的时区                       |
 | `M365_MODEL_ALIAS`       | 否   | `m365-copilot`    | 模型名称                                    |
-| `API_KEY`                | 否   | `ciallo`          | API Key 认证密钥，同时作为 Web 管理密码     |
+| `API_KEY`                | **是** | —                  | API Key 认证密钥，同时作为 Web 管理密码，**必须设置** |
 | `AUTO_REFRESH`           | 否   | `true`            | 是否自动刷新 Token                          |
 | `REFRESH_BEFORE_SECONDS` | 否   | `300`             | Token 过期前多少秒开始刷新                  |
 | `IDLE_TIMEOUT_MINUTES`   | 否   | `30`              | 空闲多少分钟无请求后暂停自动刷新            |
@@ -117,7 +117,7 @@ _auto_refresh_loop → 检查 auto_refresh_enabled → 检查空闲时间
 | 设置             | 值                                                |
 | ---------------- | ------------------------------------------------- |
 | Base URL         | `http://your-server:8000/v1`                    |
-| API Key          | 你设置的 `API_KEY` 值（默认 `ciallo`） |
+| API Key          | 你设置的 `API_KEY` 值（**必须在 .env 中设置**） |
 | Model            | `m365-copilot`                                  |
 | Persistent model | `m365-copilot:persist`                          |
 
@@ -141,10 +141,10 @@ Model: m365-copilot
 
 ### API Key
 
-默认 API Key 为 `ciallo`。在 `.env` 中设置 `API_KEY=your-secret-key` 可修改。所有 `/v1/` API 请求需携带 `Authorization: Bearer your-key` 头。
+**必须在 `.env` 中设置 `API_KEY`**，否则所有 `/v1/` API 端点无认证开放。启动时未设置会打印警告。所有 `/v1/` API 请求需携带 `Authorization: Bearer your-key` 头。
 
 ```bash
-curl -H "Authorization: Bearer ciallo" http://localhost:8000/v1/models
+curl -H "Authorization: Bearer YOUR_SECRET_KEY" http://localhost:8000/v1/models
 ```
 
 ### Web 管理页面

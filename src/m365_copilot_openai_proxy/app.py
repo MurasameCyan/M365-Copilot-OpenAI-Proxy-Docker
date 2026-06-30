@@ -35,6 +35,8 @@ def create_app(
     app.state.auto_refresh_enabled = True
     app.state.last_request_time = time.time()
     app.state.idle_timeout_minutes = resolved_settings.idle_timeout_minutes
+    if not resolved_settings.api_key:
+        print("WARNING: API_KEY is not set. All /v1/ API endpoints are open without authentication. Set API_KEY in .env to secure your instance.")
     app.state.copilot_client_factory = copilot_client_factory or (
         lambda: SubstrateCopilotClient(app.state.token_store.get(), resolved_settings.time_zone)
     )
@@ -87,9 +89,15 @@ def create_app(
                     pass
         if not resolved_settings.api_key:
             return await call_next(request)
-        # Skip auth for admin page and management endpoints
-        if path in ("/", "/favicon.ico", "/healthz", "/admin/token/status", "/admin/token/update", "/admin/token/auto-capture", "/admin/token/auto-refresh-toggle", "/admin/cookie/inject", "/admin/chromium/login-status", "/admin/login"):
+        # Skip auth for admin page (has its own cookie check) and health endpoints
+        if path in ("/", "/favicon.ico", "/healthz", "/admin/login"):
             return await call_next(request)
+        # Protect /admin/* endpoints with cookie auth
+        if path.startswith("/admin/") and not _is_admin_authenticated(request):
+            return with_cors(JSONResponse(
+                status_code=401,
+                content={"error": {"message": "Admin authentication required", "type": "auth_error"}},
+            ))
         auth = request.headers.get("Authorization", "")
         match = re.match(r"^Bearer\s+(.+)$", auth, re.IGNORECASE)
         if match and match.group(1) == resolved_settings.api_key:
