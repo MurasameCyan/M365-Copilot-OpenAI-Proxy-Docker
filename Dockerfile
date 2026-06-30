@@ -22,7 +22,7 @@ COPY --chown=app:app pyproject.toml .
 COPY --chown=app:app uv.lock .
 
 # Install Python dependencies
-RUN uv sync --frozen --no-dev
+RUN uv sync --frozen --no-dev && chown -R app:app /app
 
 # Copy project source and entrypoint
 COPY --chown=app:app src/ src/
