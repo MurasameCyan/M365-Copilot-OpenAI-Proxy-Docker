@@ -1004,6 +1004,7 @@ def create_app(
         return {
             "id": acc.id,
             "name": acc.name,
+            "email": acc.email,
             "cdp_port": acc.cdp_port,
             "token_source": acc.token_source,
             "has_token": bool(acc.token),
@@ -2137,6 +2138,7 @@ const i18n={
     confirm_del_account:'确定删除该账户？绑定它的 Key 将解绑。',confirm_del_key:'确定删除该 Key？',
     valid_short:'有效',invalid_short:'无效',no_accounts:'暂无账户',no_keys:'暂无 Key',unbound:'未绑定',
     rebind_prompt:'输入要绑定的账户 ID（留空则解绑）：',push_token_prompt:'粘贴该账户的 access_token 或 wss:// URL：',
+    rebind_title:'改绑 M365 账号',rebind_unbind:'（不绑定 / 解绑）',rebind_confirm:'确定',
     title_update_token:'更新 Token',btn_update:'更新 Token',btn_check_login:'检查登录',btn_auto_capture:'自动刷新',
     title_status:'Token 与 登录状态',loading:'加载中...',
     title_quick_start:'快速开始',qs_recommended:'推荐：',qs_install_script:'安装油猴脚本（',qs_script_name:'一键脚本',
@@ -2204,6 +2206,7 @@ const i18n={
     confirm_del_account:'Delete this account? Keys bound to it will be unbound.',confirm_del_key:'Delete this key?',
     valid_short:'Valid',invalid_short:'Invalid',no_accounts:'No accounts yet',no_keys:'No keys yet',unbound:'Unbound',
     rebind_prompt:'Enter the account ID to bind (leave empty to unbind):',push_token_prompt:'Paste this account\\u0027s access_token or wss:// URL:',
+    rebind_title:'Rebind M365 account',rebind_unbind:'(Unbound)',rebind_confirm:'Confirm',
     title_update_token:'Update Token',btn_update:'Update Token',btn_check_login:'Check Login',btn_auto_capture:'Auto Capture',
     title_status:'Token & Login Status',loading:'Loading...',
     title_quick_start:'Quick Start',qs_recommended:'Recommended:',qs_install_script:'Install the Tampermonkey script (',qs_script_name:'one-click script',
@@ -2506,7 +2509,7 @@ async function loadAccounts(){
       const rem=valid?(' '+Math.floor((st.seconds_remaining||0)/60)+'m'):'';
       const badge='<span style="padding:.1rem .5rem;border-radius:99px;font-size:.72rem;background:'+(valid?'#065f46':'#7f1d1d')+';color:'+(valid?'#d1fae5':'#fee2e2')+'">'+(valid?t('valid_short'):t('invalid_short'))+rem+'</span>';
       h+='<tr style="border-top:1px solid #334155">'
-        +'<td style="padding:.4rem"><div>'+esc(a.name||a.id)+'</div><div style="color:#475569;font-size:.7rem">'+esc(a.id)+' · '+a.key_count+' key</div></td>'
+        +'<td style="padding:.4rem"><div>'+esc(a.name||a.id)+(a.email?' <span style="color:#64748b;font-size:.72rem">'+esc(a.email)+'</span>':'')+'</div><div style="color:#475569;font-size:.7rem">'+esc(a.id)+' · '+a.key_count+' key</div></td>'
         +'<td style="padding:.4rem">'+badge+'</td>'
         +'<td style="padding:.4rem;color:#64748b">'+esc(a.token_source)+'</td>'
         +'<td style="padding:.4rem;text-align:right;white-space:nowrap">'
@@ -2660,14 +2663,36 @@ function copyKey(id){
   const k=__keys.find(x=>x.id===id);if(!k)return;
   navigator.clipboard.writeText(k.key).then(()=>{},()=>{});
 }
-async function rebindKey(id){
-  const account_id=prompt(t('rebind_prompt')+'\\n'+__accounts.map(a=>a.id+' = '+(a.name||'')).join('\\n'));
-  if(account_id===null)return;
-  try{
-    const r=await fetch('/admin/keys/'+id,{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({account_id:account_id})});
-    if(!r.ok){const d=await r.json().catch(()=>({}));alert((d.error&&d.error.message)||'error');return}
-    loadKeys();loadAccounts();
-  }catch(e){}
+function acctLabel(a){
+  const name=a.name||a.id;
+  return a.email?(name+' ('+a.email+')'):name;
+}
+function rebindKey(id){
+  const k=__keys.find(x=>x.id===id);
+  const cur=k?k.account_id:'';
+  let opts='<option value="">'+t('rebind_unbind')+'</option>';
+  __accounts.forEach(a=>{opts+='<option value="'+a.id+'"'+(a.id===cur?' selected':'')+'>'+esc(acctLabel(a))+'</option>'});
+  const ov=document.createElement('div');
+  ov.style.cssText='position:fixed;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;z-index:1000';
+  ov.innerHTML='<div style="background:#1e293b;border:1px solid #334155;border-radius:12px;padding:1.25rem;width:340px;max-width:90vw">'
+    +'<div style="font-weight:600;margin-bottom:.75rem">'+t('rebind_title')+'</div>'
+    +'<select id="rebind-select" style="width:100%;padding:8px 10px;background:#0f172a;border:1px solid #334155;border-radius:8px;color:#e2e8f0;font-size:.85rem;outline:none">'+opts+'</select>'
+    +'<div style="display:flex;gap:.5rem;justify-content:flex-end;margin-top:1rem">'
+    +'<button id="rebind-cancel" style="font-size:.8rem;padding:6px 14px;background:#334155">'+t('kf_cancel')+'</button>'
+    +'<button id="rebind-ok" style="font-size:.8rem;padding:6px 14px">'+t('rebind_confirm')+'</button>'
+    +'</div></div>';
+  document.body.appendChild(ov);
+  const close=()=>ov.remove();
+  ov.addEventListener('click',e=>{if(e.target===ov)close()});
+  ov.querySelector('#rebind-cancel').onclick=close;
+  ov.querySelector('#rebind-ok').onclick=async()=>{
+    const account_id=ov.querySelector('#rebind-select').value;
+    try{
+      const r=await fetch('/admin/keys/'+id,{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({account_id:account_id})});
+      if(!r.ok){const d=await r.json().catch(()=>({}));alert((d.error&&d.error.message)||'error');return}
+      close();loadKeys();loadAccounts();
+    }catch(e){}
+  };
 }
 async function toggleKey(id,enabled){
   try{await fetch('/admin/keys/'+id,{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enabled})});loadKeys()}catch(e){}

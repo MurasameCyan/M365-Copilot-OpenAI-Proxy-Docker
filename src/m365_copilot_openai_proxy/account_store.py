@@ -17,6 +17,32 @@ from .token_store import decode_jwt_payload, is_substrate_token_claims
 _CDP_PORT_BASE = 9222
 
 
+def extract_identity(token: str) -> tuple[str, str]:
+    """Best-effort (display_name, email) from a Substrate JWT's claims.
+
+    The Tampermonkey push and CDP capture both carry a token whose claims hold
+    the signed-in identity, so we can label pool accounts without extra input.
+    Returns empty strings when nothing usable is found.
+    """
+    if not token:
+        return "", ""
+    try:
+        claims = decode_jwt_payload(token)
+    except Exception:
+        return "", ""
+    email = ""
+    for key in ("email", "upn", "unique_name", "preferred_username"):
+        val = claims.get(key)
+        if isinstance(val, str) and "@" in val:
+            email = val.strip()
+            break
+    name = claims.get("name")
+    name = name.strip() if isinstance(name, str) else ""
+    if not name and email:
+        name = email.split("@")[0]
+    return name, email
+
+
 @dataclass
 class Account:
     """A single M365 Copilot account in the multi-tenant pool.
@@ -28,6 +54,7 @@ class Account:
 
     id: str = field(default_factory=lambda: "acct_" + uuid.uuid4().hex[:12])
     name: str = ""
+    email: str = ""
     token: str = ""
     cdp_port: int = _CDP_PORT_BASE
     # "manual" = token pushed by user (Tampermonkey / paste); "cdp" = auto-captured.
@@ -88,6 +115,7 @@ class AccountStore:
                 self._accounts[acc_id] = Account(
                     id=raw.get("id", acc_id),
                     name=raw.get("name", ""),
+                    email=raw.get("email", ""),
                     token=raw.get("token", ""),
                     cdp_port=int(raw.get("cdp_port", _CDP_PORT_BASE)),
                     token_source=raw.get("token_source", "manual"),
@@ -129,8 +157,10 @@ class AccountStore:
     # -------------------------------------------------------------- mutations
     def add(self, name: str = "", token: str = "", token_source: str = "manual") -> Account:
         with self._lock:
+            ident_name, email = extract_identity(token)
             acc = Account(
-                name=name,
+                name=name or ident_name,
+                email=email,
                 token=token,
                 cdp_port=self._next_cdp_port(),
                 token_source=token_source,
@@ -145,6 +175,11 @@ class AccountStore:
             if acc is None:
                 return None
             acc.token = token
+            ident_name, email = extract_identity(token)
+            if email:
+                acc.email = email
+            if ident_name and not acc.name:
+                acc.name = ident_name
             if token_source is not None:
                 acc.token_source = token_source
             acc.updated_at = time.time()
