@@ -16,9 +16,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, StreamingResponse, Response
 
 from .config import Settings
+from .account_store import Account, AccountStore
+from .key_store import ApiKey, KeyStore
+from .refresh_scheduler import RefreshScheduler
 from .session_store import PersistentSession, PersistentSessionStore
 from .substrate_client import SubstrateCopilotClient, SubstrateCopilotError
-from .token_store import AccessTokenStore, write_token, write_username, read_username, decode_jwt_payload, init_token_dir, write_tone, read_tone, write_tool_prompt, read_tool_prompt, write_system_prompt, read_system_prompt
+from .token_store import AccessTokenStore, write_token, write_username, read_username, decode_jwt_payload, is_substrate_token_claims, init_token_dir, write_tone, read_tone, write_tool_prompt, read_tool_prompt, write_system_prompt, read_system_prompt
 from .models import AnthropicMessagesRequest, OpenAIChatRequest, OpenAIResponsesRequest
 from .translator import translate_anthropic_request, translate_openai_request, translate_responses_request, flatten_content, default_tool_system_prompt
 
@@ -345,6 +348,21 @@ def create_app(
     app.state.session_store = PersistentSessionStore(
         persist_path=Path(resolved_settings.token_dir) / "sessions.json"
     )  # Persist to mounted volume so conversations survive container restarts
+    # Multi-tenant stores: account pool (each owns an isolated token + Chromium
+    # profile/CDP port) and API key table (each key bound to one account, scheme B).
+    app.state.account_store = AccountStore(
+        persist_path=Path(resolved_settings.token_dir) / "accounts.json"
+    )
+    app.state.key_store = KeyStore(
+        persist_path=Path(resolved_settings.token_dir) / "keys.json"
+    )
+    # On-demand token refresh scheduler: brings one account's Chromium up at a
+    # time (serial), captures a fresh token via CDP, then tears it down. Keeps
+    # peak memory close to single-tenant even with many accounts.
+    app.state.refresh_scheduler = RefreshScheduler(
+        app.state.account_store,
+        profile_root=Path(resolved_settings.token_dir) / "profiles",
+    )
     app.state.call_log: list[dict] = []  # API call log for web UI display
     app.state.captured_payloads: list[dict] = []  # Substrate chat payloads captured via get_token.js for mode comparison
     app.state.auto_refresh_enabled = False  # On-demand: only refresh when /v1/ requests come in
@@ -369,7 +387,12 @@ def create_app(
     _LOGIN_LOCKOUT_SEC = 60.0   # lockout duration
 
     app.state.copilot_client_factory = copilot_client_factory or (
-        lambda: SubstrateCopilotClient(app.state.token_store.get(), resolved_settings.time_zone, getattr(app.state, 'current_tone', 'Magic'), getattr(app.state, 'tool_prompt', ''))
+        lambda token=None, tone=None, tool_prompt=None: SubstrateCopilotClient(
+            token if token is not None else app.state.token_store.get(),
+            resolved_settings.time_zone,
+            tone if tone is not None else getattr(app.state, 'current_tone', 'Magic'),
+            tool_prompt if tool_prompt is not None else getattr(app.state, 'tool_prompt', ''),
+        )
     )
 
     def _is_admin_authenticated(request: Request) -> bool:
@@ -423,43 +446,49 @@ def create_app(
         # Track last request time for idle detection & on-demand refresh
         if path.startswith("/v1/"):
             app.state.last_request_time = time.time()
-            # On-demand refresh: if auto_refresh paused, re-enable it on /v1/ requests
-            if not app.state.auto_refresh_enabled:
-                app.state.auto_refresh_enabled = True
-                token = app.state.token_store.get()
-                need_refresh = False
-                if not token:
-                    need_refresh = True
-                else:
-                    try:
-                        from .token_store import decode_jwt_payload
-                        claims = decode_jwt_payload(token)
-                        if time.time() > claims.get("exp", 0):
-                            need_refresh = True
-                    except Exception:
-                        need_refresh = True
-                if need_refresh:
-                    # Also refresh synchronously so the request doesn't have to wait for the loop
-                    try:
-                        from .cli import _cdp_extract_token
-                        cdp_port = getattr(app.state, 'settings', None) and getattr(app.state.settings, 'cdp_port', 9222) or 9222
-                        import asyncio
-                        new_token = await _cdp_extract_token(cdp_port, allow_nudge=True)
-                        if new_token:
-                            write_token(new_token)
-                            app.state.token_store._token = new_token
-                            app.state.token_store._mtime_ns = None
-                    except Exception:
-                        pass  # If sync refresh fails, the background loop will keep trying
-        if not resolved_settings.api_key:
+
+        # Public paths: admin page (own cookie auth), user page, health, and all
+        # /admin/* + /user/* endpoints (each does its own cookie/key check).
+        if path in ("/", "/admin", "/favicon.ico", "/healthz") or path.startswith("/admin/") or path.startswith("/user/"):
             return await call_next(request)
-        # Skip auth for admin page (has its own cookie check) and health endpoints
-        if path in ("/", "/favicon.ico", "/healthz", "/admin/login", "/admin/token/status", "/admin/token/update", "/admin/token/auto-capture", "/admin/token/auto-refresh-toggle", "/admin/cookie/inject", "/admin/chromium/login-status", "/admin/chromium/logout", "/admin/call-log", "/admin/capture-payload", "/admin/tone", "/admin/tool-prompt", "/admin/system-prompt"):
-            return await call_next(request)
+
         auth = request.headers.get("Authorization", "")
         match = re.match(r"^Bearer\s+(.+)$", auth, re.IGNORECASE)
-        if match and match.group(1) == resolved_settings.api_key:
+        raw_key = match.group(1) if match else ""
+
+        # Multi-tenant: resolve the API key -> ApiKey -> bound Account.
+        key_obj = app.state.key_store.resolve(raw_key) if raw_key else None
+        if key_obj is not None:
+            if not key_obj.enabled:
+                return with_cors(JSONResponse(
+                    status_code=401,
+                    content={"error": {"message": "API key is disabled", "type": "auth_error"}},
+                ))
+            account = app.state.account_store.get(key_obj.account_id) if key_obj.account_id else None
+            # Bring the bound account's token up to date on demand (serial, one
+            # Chromium at a time). No-op if the token is still valid.
+            if account is not None and path.startswith("/v1/"):
+                try:
+                    await app.state.refresh_scheduler.ensure_fresh(account.id)
+                    account = app.state.account_store.get(account.id) or account
+                except Exception:
+                    pass  # Scheduler failures fall back to whatever token we have
+            request.state.api_key_obj = key_obj
+            request.state.account = account
             return await call_next(request)
+
+        # Legacy single API_KEY fallback (global admin key, no bound account).
+        if resolved_settings.api_key and raw_key == resolved_settings.api_key:
+            request.state.api_key_obj = None
+            request.state.account = None
+            return await call_next(request)
+
+        # No auth configured at all (no keys registered and no legacy key): open.
+        if not resolved_settings.api_key and not app.state.key_store.list():
+            request.state.api_key_obj = None
+            request.state.account = None
+            return await call_next(request)
+
         return with_cors(JSONResponse(
             status_code=401,
             content={"error": {"message": "Invalid API key", "type": "auth_error"}},
@@ -468,8 +497,18 @@ def create_app(
     def get_settings() -> Settings:
         return app.state.settings
 
-    def get_copilot_client() -> SubstrateCopilotClient:
+    def get_copilot_client(raw_request: Request) -> SubstrateCopilotClient:
         try:
+            key_obj = getattr(raw_request.state, "api_key_obj", None)
+            account = getattr(raw_request.state, "account", None)
+            # Per-key overrides: bound account's token + the key's own tone /
+            # tool_prompt. Falls back to global app.state when unbound (legacy key).
+            token = account.token if account is not None else None
+            tone = key_obj.tone if key_obj is not None else None
+            tool_prompt = key_obj.tool_prompt if key_obj is not None else None
+            return app.state.copilot_client_factory(token=token, tone=tone, tool_prompt=tool_prompt)
+        except TypeError:
+            # Test-injected factory may take no arguments.
             return app.state.copilot_client_factory()
         except Exception as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
@@ -938,7 +977,287 @@ def create_app(
         write_system_prompt(prompt)
         return {"status": "ok", "system_prompt": prompt}
 
+    # ============================ Multi-tenant admin API ============================
+    def _account_public(acc: Account) -> dict:
+        """Serialize an account for the admin UI (never leak the raw token)."""
+        return {
+            "id": acc.id,
+            "name": acc.name,
+            "cdp_port": acc.cdp_port,
+            "token_source": acc.token_source,
+            "has_token": bool(acc.token),
+            "token_status": acc.token_status(),
+            "key_count": len(app.state.key_store.list_for_account(acc.id)),
+            "created_at": acc.created_at,
+            "updated_at": acc.updated_at,
+        }
+
+    def _key_public(k: ApiKey) -> dict:
+        """Serialize an API key for the admin UI (raw key shown so admin can copy)."""
+        acc = app.state.account_store.get(k.account_id) if k.account_id else None
+        return {
+            "id": k.id,
+            "key": k.key,
+            "name": k.name,
+            "account_id": k.account_id,
+            "account_name": acc.name if acc is not None else "",
+            "enabled": k.enabled,
+            "tone": k.tone,
+            "tool_prompt": k.tool_prompt,
+            "system_prompt": k.system_prompt,
+            "created_at": k.created_at,
+            "updated_at": k.updated_at,
+        }
+
+    @app.get("/admin/accounts")
+    async def list_accounts(request: Request) -> dict:
+        err = _require_admin(request)
+        if err: return err
+        return {"accounts": [_account_public(a) for a in app.state.account_store.list()]}
+
+    @app.post("/admin/accounts")
+    async def add_account(request: Request) -> dict:
+        err = _require_admin(request)
+        if err: return err
+        body = await request.json()
+        name = str(body.get("name", "")).strip()
+        token = str(body.get("token", "")).strip()
+        if token:
+            match = re.search(r"access_token=([^&\s]+)", token)
+            token = match.group(1) if match else token
+            try:
+                claims = decode_jwt_payload(token)
+                if not is_substrate_token_claims(claims):
+                    return _json_err(400, "Token is not a substrate.office.com token")
+            except Exception:
+                return _json_err(400, "Not a valid JWT token")
+        acc = app.state.account_store.add(name=name, token=token,
+                                          token_source="manual" if token else "cdp")
+        return {"status": "ok", "account": _account_public(acc)}
+
+    @app.post("/admin/accounts/{acc_id}/token")
+    async def update_account_token(acc_id: str, request: Request) -> dict:
+        err = _require_admin(request)
+        if err: return err
+        body = await request.json()
+        token = str(body.get("token", "")).strip()
+        if not token:
+            return _json_err(400, "Token is empty")
+        match = re.search(r"access_token=([^&\s]+)", token)
+        token = match.group(1) if match else token
+        try:
+            claims = decode_jwt_payload(token)
+            if not is_substrate_token_claims(claims):
+                return _json_err(400, "Token is not a substrate.office.com token")
+        except Exception:
+            return _json_err(400, "Not a valid JWT token")
+        acc = app.state.account_store.update_token(acc_id, token, token_source="manual")
+        if acc is None:
+            return _json_err(404, "Account not found")
+        return {"status": "ok", "account": _account_public(acc)}
+
+    @app.post("/admin/accounts/{acc_id}/rename")
+    async def rename_account(acc_id: str, request: Request) -> dict:
+        err = _require_admin(request)
+        if err: return err
+        body = await request.json()
+        name = str(body.get("name", "")).strip()
+        acc = app.state.account_store.rename(acc_id, name)
+        if acc is None:
+            return _json_err(404, "Account not found")
+        return {"status": "ok", "account": _account_public(acc)}
+
+    @app.post("/admin/accounts/{acc_id}/refresh")
+    async def refresh_account(acc_id: str, request: Request) -> dict:
+        err = _require_admin(request)
+        if err: return err
+        if app.state.account_store.get(acc_id) is None:
+            return _json_err(404, "Account not found")
+        try:
+            ok = await app.state.refresh_scheduler.ensure_fresh(acc_id, force=True)
+        except Exception as exc:
+            return _json_err(502, f"Refresh failed: {exc}")
+        acc = app.state.account_store.get(acc_id)
+        return {"status": "ok", "refreshed": ok, "account": _account_public(acc) if acc else None}
+
+    @app.delete("/admin/accounts/{acc_id}")
+    async def remove_account(acc_id: str, request: Request) -> dict:
+        err = _require_admin(request)
+        if err: return err
+        if not app.state.account_store.remove(acc_id):
+            return _json_err(404, "Account not found")
+        app.state.key_store.detach_account(acc_id)  # unbind keys that pointed here
+        return {"status": "ok"}
+
+    @app.get("/admin/keys")
+    async def list_keys(request: Request) -> dict:
+        err = _require_admin(request)
+        if err: return err
+        return {"keys": [_key_public(k) for k in app.state.key_store.list()]}
+
+    @app.post("/admin/keys")
+    async def add_key(request: Request) -> dict:
+        err = _require_admin(request)
+        if err: return err
+        body = await request.json()
+        name = str(body.get("name", "")).strip()
+        account_id = str(body.get("account_id", "")).strip()
+        tone = str(body.get("tone", "Magic")).strip() or "Magic"
+        if tone not in _TONE_VALUES:
+            return _json_err(400, f"Invalid tone. Allowed: {', '.join(sorted(_TONE_VALUES))}")
+        if account_id and app.state.account_store.get(account_id) is None:
+            return _json_err(404, "Bound account not found")
+        k = app.state.key_store.add(name=name, account_id=account_id, tone=tone)
+        return {"status": "ok", "key": _key_public(k)}
+
+    @app.post("/admin/keys/{key_id}")
+    async def update_key(key_id: str, request: Request) -> dict:
+        err = _require_admin(request)
+        if err: return err
+        body = await request.json()
+        fields: dict = {}
+        if "name" in body:
+            fields["name"] = str(body["name"]).strip()
+        if "account_id" in body:
+            aid = str(body["account_id"]).strip()
+            if aid and app.state.account_store.get(aid) is None:
+                return _json_err(404, "Bound account not found")
+            fields["account_id"] = aid
+        if "enabled" in body:
+            fields["enabled"] = bool(body["enabled"])
+        if "tone" in body:
+            tone = str(body["tone"]).strip() or "Magic"
+            if tone not in _TONE_VALUES:
+                return _json_err(400, f"Invalid tone. Allowed: {', '.join(sorted(_TONE_VALUES))}")
+            fields["tone"] = tone
+        if "tool_prompt" in body:
+            if not isinstance(body["tool_prompt"], str):
+                return _json_err(400, "tool_prompt must be a string")
+            fields["tool_prompt"] = body["tool_prompt"][:4000]
+        if "system_prompt" in body:
+            if not isinstance(body["system_prompt"], str):
+                return _json_err(400, "system_prompt must be a string")
+            fields["system_prompt"] = body["system_prompt"][:8000]
+        k = app.state.key_store.update(key_id, **fields)
+        if k is None:
+            return _json_err(404, "Key not found")
+        return {"status": "ok", "key": _key_public(k)}
+
+    @app.delete("/admin/keys/{key_id}")
+    async def remove_key(key_id: str, request: Request) -> dict:
+        err = _require_admin(request)
+        if err: return err
+        if not app.state.key_store.remove(key_id):
+            return _json_err(404, "Key not found")
+        return {"status": "ok"}
+
+    # ============================ User self-service API ============================
+    def _resolve_user_key(request: Request) -> ApiKey | None:
+        """Resolve the caller's own ApiKey from the Authorization header.
+
+        /user/* paths bypass the auth middleware, so they authenticate here by
+        their own API key instead of an admin cookie.
+        """
+        auth = request.headers.get("Authorization", "")
+        m = re.match(r"^Bearer\s+(.+)$", auth, re.IGNORECASE)
+        if not m:
+            return None
+        return app.state.key_store.resolve(m.group(1).strip())
+
+    @app.get("/user/me")
+    async def user_me(request: Request) -> dict:
+        k = _resolve_user_key(request)
+        if k is None:
+            return _json_err(401, "Invalid API key", "auth_error")
+        acc = app.state.account_store.get(k.account_id) if k.account_id else None
+        return {
+            "name": k.name,
+            "enabled": k.enabled,
+            "tone": k.tone,
+            "tool_prompt": k.tool_prompt,
+            "system_prompt": k.system_prompt,
+            "default_system_prompt": default_tool_system_prompt(),
+            "account": {
+                "id": acc.id,
+                "name": acc.name,
+                "has_token": bool(acc.token),
+                "token_status": acc.token_status(),
+            } if acc is not None else None,
+            "tone_options": _TONE_OPTIONS,
+        }
+
+    @app.post("/user/tone")
+    async def user_set_tone(request: Request) -> dict:
+        k = _resolve_user_key(request)
+        if k is None:
+            return _json_err(401, "Invalid API key", "auth_error")
+        body = await request.json()
+        tone = str(body.get("tone", "")).strip()
+        if tone not in _TONE_VALUES:
+            return _json_err(400, f"Invalid tone. Allowed: {', '.join(sorted(_TONE_VALUES))}")
+        app.state.key_store.update(k.id, tone=tone)
+        return {"status": "ok", "tone": tone}
+
+    @app.post("/user/tool-prompt")
+    async def user_set_tool_prompt(request: Request) -> dict:
+        k = _resolve_user_key(request)
+        if k is None:
+            return _json_err(401, "Invalid API key", "auth_error")
+        body = await request.json()
+        prompt = body.get("tool_prompt")
+        if not isinstance(prompt, str):
+            return _json_err(400, "tool_prompt must be a string")
+        app.state.key_store.update(k.id, tool_prompt=prompt[:4000])
+        return {"status": "ok", "tool_prompt": prompt[:4000]}
+
+    @app.post("/user/system-prompt")
+    async def user_set_system_prompt(request: Request) -> dict:
+        k = _resolve_user_key(request)
+        if k is None:
+            return _json_err(401, "Invalid API key", "auth_error")
+        body = await request.json()
+        prompt = body.get("system_prompt")
+        if not isinstance(prompt, str):
+            return _json_err(400, "system_prompt must be a string")
+        app.state.key_store.update(k.id, system_prompt=prompt[:8000])
+        return {"status": "ok", "system_prompt": prompt[:8000]}
+
+    @app.post("/user/account/token")
+    async def user_set_account_token(request: Request) -> dict:
+        """Let a user push/update the token for their own bound account.
+
+        If the key has no bound account yet, create one and bind it (self-service
+        account provisioning requested for the user UI).
+        """
+        k = _resolve_user_key(request)
+        if k is None:
+            return _json_err(401, "Invalid API key", "auth_error")
+        body = await request.json()
+        token = str(body.get("token", "")).strip()
+        if not token:
+            return _json_err(400, "Token is empty")
+        match = re.search(r"access_token=([^&\s]+)", token)
+        token = match.group(1) if match else token
+        try:
+            claims = decode_jwt_payload(token)
+            if not is_substrate_token_claims(claims):
+                return _json_err(400, "Token is not a substrate.office.com token")
+        except Exception:
+            return _json_err(400, "Not a valid JWT token")
+        acc_id = k.account_id
+        if not acc_id or app.state.account_store.get(acc_id) is None:
+            acc = app.state.account_store.add(name=k.name or "user", token=token, token_source="manual")
+            app.state.key_store.update(k.id, account_id=acc.id)
+        else:
+            acc = app.state.account_store.update_token(acc_id, token, token_source="manual")
+        return {"status": "ok", "token_status": acc.token_status() if acc else None}
+
     @app.get("/", response_class=HTMLResponse)
+    async def user_page(request: Request) -> str:
+        # Root is the user-facing page. Admin console moved to /admin.
+        return _USER_HTML
+
+    @app.get("/admin", response_class=HTMLResponse)
     async def admin_page(request: Request) -> str:
         if _admin_secret and not _is_admin_authenticated(request):
             return _LOGIN_HTML
@@ -1004,7 +1323,9 @@ def create_app(
             # incremental optimization actually kicks in across turns.
             call_record["incremental"] = incremental
             call_record["turn_count"] = session.turn_count if session is not None else None
-            translated = translate_openai_request(request, incremental=incremental, system_override=getattr(app.state, 'system_prompt', ''))
+            _key_obj = getattr(raw_request.state, "api_key_obj", None)
+            _system_override = _key_obj.system_prompt if _key_obj is not None else getattr(app.state, 'system_prompt', '')
+            translated = translate_openai_request(request, incremental=incremental, system_override=_system_override)
             if request.stream:
                 # Save call record for streaming (tool_calls_result resolved later)
                 call_record["streaming"] = True
@@ -1195,11 +1516,17 @@ def _persistent_session(
     fallback_key: str | None = None,
     request: OpenAIChatRequest | None = None,
 ) -> PersistentSession | None:
+    # Multi-tenant: prefix every session key with the caller's key id (fallback to
+    # the bound account id) so two different API keys never share an M365 thread,
+    # even when their session ids / opening messages collide.
+    key_obj = getattr(raw_request.state, "api_key_obj", None)
+    account = getattr(raw_request.state, "account", None)
+    tenant = (key_obj.id if key_obj is not None else None) or (account.id if account is not None else "global")
     header_key = (raw_request.headers.get(_SESSION_ID_HEADER) or "").strip()
     if header_key:
-        return app.state.session_store.get(f"header:{header_key}")
+        return app.state.session_store.get(f"{tenant}:header:{header_key}")
     if model.endswith(_PERSIST_MODEL_SUFFIX):
-        return app.state.session_store.get(f"model:{fallback_key or 'default'}")
+        return app.state.session_store.get(f"{tenant}:model:{fallback_key or 'default'}")
     # Auto-detect conversation from the request messages so that all turns of the
     # same Trae conversation reuse one M365 Copilot session (instead of creating a
     # brand-new chat record on every request). A new Trae conversation has a
@@ -1213,8 +1540,8 @@ def _persistent_session(
         # context and make it hallucinate. So on an opening turn, start fresh.
         has_assistant = any(m.role == "assistant" for m in request.messages)
         if not has_assistant:
-            return app.state.session_store.reset(f"auto:{sid}")
-        return app.state.session_store.get(f"auto:{sid}")
+            return app.state.session_store.reset(f"{tenant}:auto:{sid}")
+        return app.state.session_store.get(f"{tenant}:auto:{sid}")
     return None
 
 
@@ -1487,9 +1814,32 @@ a:hover{text-decoration:underline}
 </head>
 <body>
 <div class="container">
-<h1>Ciallo Ms-365 OpenAI Proxy <button id="lang-toggle" onclick="toggleLang()" style="font-size:14px;padding:5px 14px;border:1px solid rgba(139,92,246,0.5);border-radius:20px;background:linear-gradient(135deg,rgba(6,182,212,0.18),rgba(139,92,246,0.18));cursor:pointer;vertical-align:middle;margin-left:12px;transition:all .2s;letter-spacing:1px;font-weight:600;line-height:1">&#127760; EN</button></h1>
+<h1>Ciallo Ms-365 OpenAI Proxy <span style="font-size:13px;color:#8b5cf6;font-weight:600" data-i18n="multi_badge">多租户</span> <button id="lang-toggle" onclick="toggleLang()" style="font-size:14px;padding:5px 14px;border:1px solid rgba(139,92,246,0.5);border-radius:20px;background:linear-gradient(135deg,rgba(6,182,212,0.18),rgba(139,92,246,0.18));cursor:pointer;vertical-align:middle;margin-left:12px;transition:all .2s;letter-spacing:1px;font-weight:600;line-height:1">&#127760; EN</button></h1>
 
 <div class="card">
+<div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.75rem">
+<h2 data-i18n="title_accounts" style="margin:0">账户池</h2>
+<button onclick="addAccount()" style="margin-left:auto;font-size:.8rem;padding:5px 12px" data-i18n="btn_add_account">添加账户</button>
+</div>
+<div style="font-size:.8rem;color:#64748b;margin-bottom:.5rem" data-i18n="accounts_hint">每个账户拥有独立的 M365 Token 与 Chromium 刷新配置。刷新按需串行拉起浏览器，用完即关。</div>
+<div id="accounts-content"><span style="color:#64748b" data-i18n="loading">加载中...</span></div>
+</div>
+
+<div class="card">
+<div style="display:flex;align-items:center;gap:.5rem;margin-bottom:.75rem">
+<h2 data-i18n="title_keys" style="margin:0">API Key 管理</h2>
+<button onclick="addKey()" style="margin-left:auto;font-size:.8rem;padding:5px 12px" data-i18n="btn_add_key">新建 Key</button>
+</div>
+<div style="font-size:.8rem;color:#64748b;margin-bottom:.5rem" data-i18n="keys_hint">每个 Key 绑定一个账户，可单独设置对话模式、提示词并随时启用/停用。</div>
+<div id="keys-content"><span style="color:#64748b" data-i18n="loading">加载中...</span></div>
+</div>
+
+<details class="card">
+<summary style="cursor:pointer;font-size:1.1rem;font-weight:600;color:#e2e8f0;list-style:none;display:flex;align-items:center;gap:.5rem">
+<span data-i18n="title_legacy">全局 / 兼容 Token（高级）</span>
+<span style="font-size:.7rem;color:#475569;margin-left:auto" data-i18n="click_expand">点击展开</span>
+</summary>
+<div style="margin-top:.75rem">
 <h2 data-i18n="title_update_token">更新 Token</h2>
 <p style="color:#64748b;font-size:.85rem;margin-bottom:.75rem" data-i18n="desc_paste_token">粘贴 access_token 值或完整的 wss:// URL</p>
 <textarea id="token-input" placeholder="eyJ0eXAiOiJKV1QiLCJhbGci...&#10;&#10;or full URL:&#10;wss://substrate.office.com/m365Copilot/Chathub/...?access_token=eyJ..."></textarea>
@@ -1502,6 +1852,7 @@ a:hover{text-decoration:underline}
 </div>
 <div id="update-msg" class="msg"></div>
 </div>
+</details>
 
 <div class="card">
 <h2 data-i18n="title_status">Token 与 登录状态</h2>
@@ -1623,6 +1974,19 @@ POST /v1/messages
 <script>
 const i18n={
   zh:{
+    multi_badge:'多租户',
+    title_accounts:'账户池',btn_add_account:'添加账户',
+    accounts_hint:'每个账户拥有独立的 M365 Token 与 Chromium 刷新配置。刷新按需串行拉起浏览器，用完即关。',
+    title_keys:'API Key 管理',btn_add_key:'新建 Key',
+    keys_hint:'每个 Key 绑定一个账户，可单独设置对话模式、提示词并随时启用/停用。',
+    title_legacy:'全局 / 兼容 Token（高级）',
+    acct_prompt_name:'账户名称（可选）：',acct_prompt_token:'可选：粘贴该账户的 access_token 或 wss:// URL（留空则稍后用 CDP 刷新）：',
+    key_prompt_name:'Key 名称（可选，如用户/用途）：',
+    col_name:'名称',col_account:'账户',col_token:'Token',col_status:'状态',col_actions:'操作',col_key:'Key',col_mode:'模式',col_enabled:'启用',
+    btn_refresh:'刷新',btn_rebind:'改绑',btn_delete:'删除',btn_copy:'复制',btn_enable:'启用',btn_disable:'停用',btn_push_token:'推送 Token',
+    confirm_del_account:'确定删除该账户？绑定它的 Key 将解绑。',confirm_del_key:'确定删除该 Key？',
+    valid_short:'有效',invalid_short:'无效',no_accounts:'暂无账户',no_keys:'暂无 Key',unbound:'未绑定',
+    rebind_prompt:'输入要绑定的账户 ID（留空则解绑）：',push_token_prompt:'粘贴该账户的 access_token 或 wss:// URL：',
     title_update_token:'更新 Token',btn_update:'更新 Token',btn_check_login:'检查登录',btn_auto_capture:'自动刷新',
     title_status:'Token 与 登录状态',loading:'加载中...',
     title_quick_start:'快速开始',qs_recommended:'推荐：',qs_install_script:'安装油猴脚本（',qs_script_name:'一键脚本',
@@ -1669,6 +2033,19 @@ const i18n={
     system_prompt_reset_confirm:'确定要将系统级提示词恢复为内置默认吗？当前自定义内容将被清空。',
   },
   en:{
+    multi_badge:'Multi-tenant',
+    title_accounts:'Account Pool',btn_add_account:'Add Account',
+    accounts_hint:'Each account owns an isolated M365 token and Chromium refresh profile. Refresh brings one browser up on demand (serial) and tears it down afterwards.',
+    title_keys:'API Key Management',btn_add_key:'New Key',
+    keys_hint:'Each key is bound to one account, with its own conversation mode and prompts, and can be enabled/disabled anytime.',
+    title_legacy:'Global / Legacy Token (Advanced)',
+    acct_prompt_name:'Account name (optional):',acct_prompt_token:'Optional: paste this account\\u0027s access_token or wss:// URL (leave empty to refresh via CDP later):',
+    key_prompt_name:'Key name (optional, e.g. user/purpose):',
+    col_name:'Name',col_account:'Account',col_token:'Token',col_status:'Status',col_actions:'Actions',col_key:'Key',col_mode:'Mode',col_enabled:'Enabled',
+    btn_refresh:'Refresh',btn_rebind:'Rebind',btn_delete:'Delete',btn_copy:'Copy',btn_enable:'Enable',btn_disable:'Disable',btn_push_token:'Push Token',
+    confirm_del_account:'Delete this account? Keys bound to it will be unbound.',confirm_del_key:'Delete this key?',
+    valid_short:'Valid',invalid_short:'Invalid',no_accounts:'No accounts yet',no_keys:'No keys yet',unbound:'Unbound',
+    rebind_prompt:'Enter the account ID to bind (leave empty to unbind):',push_token_prompt:'Paste this account\\u0027s access_token or wss:// URL:',
     title_update_token:'Update Token',btn_update:'Update Token',btn_check_login:'Check Login',btn_auto_capture:'Auto Capture',
     title_status:'Token & Login Status',loading:'Loading...',
     title_quick_start:'Quick Start',qs_recommended:'Recommended:',qs_install_script:'Install the Tampermonkey script (',qs_script_name:'one-click script',
@@ -1743,6 +2120,7 @@ function applyLang(){
     if(i18n[lang][key])el.textContent=i18n[lang][key];
   });
   loadStatus();loadChromiumStatus();loadTone();
+  loadAccounts();loadKeys();
 }
 applyLang();
 
@@ -1936,6 +2314,132 @@ async function logoutUser(){
   finally{btn.disabled=false}
 }
 
+// ============================ Multi-tenant admin JS ============================
+function esc(s){return String(s==null?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;')}
+let __accounts=[];
+async function loadAccounts(){
+  const box=document.getElementById('accounts-content');
+  if(!box)return;
+  try{
+    const r=await fetch('/admin/accounts',{credentials:'include'});
+    if(r.status===401){box.innerHTML='<span style="color:#64748b">'+t('loading')+'</span>';return}
+    const d=await r.json();
+    __accounts=d.accounts||[];
+    if(!__accounts.length){box.innerHTML='<span style="color:#64748b">'+t('no_accounts')+'</span>';return}
+    let h='<table style="width:100%;border-collapse:collapse;font-size:.82rem"><thead><tr style="color:#94a3b8;text-align:left">'
+      +'<th style="padding:.3rem">'+t('col_name')+'</th><th style="padding:.3rem">'+t('col_status')+'</th><th style="padding:.3rem">'+t('col_token')+'</th><th style="padding:.3rem;text-align:right">'+t('col_actions')+'</th></tr></thead><tbody>';
+    __accounts.forEach(a=>{
+      const st=a.token_status||{};
+      const valid=st.valid;
+      const rem=valid?(' '+Math.floor((st.seconds_remaining||0)/60)+'m'):'';
+      const badge='<span style="padding:.1rem .5rem;border-radius:99px;font-size:.72rem;background:'+(valid?'#065f46':'#7f1d1d')+';color:'+(valid?'#d1fae5':'#fee2e2')+'">'+(valid?t('valid_short'):t('invalid_short'))+rem+'</span>';
+      h+='<tr style="border-top:1px solid #334155">'
+        +'<td style="padding:.4rem"><div>'+esc(a.name||a.id)+'</div><div style="color:#475569;font-size:.7rem">'+esc(a.id)+' · '+a.key_count+' key</div></td>'
+        +'<td style="padding:.4rem">'+badge+'</td>'
+        +'<td style="padding:.4rem;color:#64748b">'+esc(a.token_source)+'</td>'
+        +'<td style="padding:.4rem;text-align:right;white-space:nowrap">'
+        +'<button onclick="refreshAccount(\\''+a.id+'\\')" style="font-size:.72rem;padding:3px 8px">'+t('btn_refresh')+'</button> '
+        +'<button onclick="pushAccountToken(\\''+a.id+'\\')" style="font-size:.72rem;padding:3px 8px;background:#334155">'+t('btn_push_token')+'</button> '
+        +'<button onclick="delAccount(\\''+a.id+'\\')" style="font-size:.72rem;padding:3px 8px;background:linear-gradient(135deg,#ef4444,#dc2626)">'+t('btn_delete')+'</button>'
+        +'</td></tr>';
+    });
+    h+='</tbody></table>';
+    box.innerHTML=h;
+  }catch(e){}
+}
+async function addAccount(){
+  const name=prompt(t('acct_prompt_name'));
+  if(name===null)return;
+  const token=prompt(t('acct_prompt_token'))||'';
+  try{
+    const r=await fetch('/admin/accounts',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,token:token})});
+    if(!r.ok){const d=await r.json().catch(()=>({}));alert((d.error&&d.error.message)||'error');return}
+    loadAccounts();loadKeys();
+  }catch(e){}
+}
+async function refreshAccount(id){
+  try{
+    const r=await fetch('/admin/accounts/'+id+'/refresh',{method:'POST',credentials:'include'});
+    const d=await r.json().catch(()=>({}));
+    if(!r.ok)alert((d.error&&d.error.message)||'error');
+    loadAccounts();
+  }catch(e){}
+}
+async function pushAccountToken(id){
+  const token=prompt(t('push_token_prompt'));
+  if(!token)return;
+  try{
+    const r=await fetch('/admin/accounts/'+id+'/token',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({token:token})});
+    if(!r.ok){const d=await r.json().catch(()=>({}));alert((d.error&&d.error.message)||'error');return}
+    loadAccounts();
+  }catch(e){}
+}
+async function delAccount(id){
+  if(!confirm(t('confirm_del_account')))return;
+  try{await fetch('/admin/accounts/'+id,{method:'DELETE',credentials:'include'});loadAccounts();loadKeys()}catch(e){}
+}
+let __keys=[];
+async function loadKeys(){
+  const box=document.getElementById('keys-content');
+  if(!box)return;
+  try{
+    const r=await fetch('/admin/keys',{credentials:'include'});
+    if(r.status===401){box.innerHTML='<span style="color:#64748b">'+t('loading')+'</span>';return}
+    const d=await r.json();
+    __keys=d.keys||[];
+    if(!__keys.length){box.innerHTML='<span style="color:#64748b">'+t('no_keys')+'</span>';return}
+    let h='<table style="width:100%;border-collapse:collapse;font-size:.82rem"><thead><tr style="color:#94a3b8;text-align:left">'
+      +'<th style="padding:.3rem">'+t('col_name')+'</th><th style="padding:.3rem">'+t('col_key')+'</th><th style="padding:.3rem">'+t('col_account')+'</th><th style="padding:.3rem">'+t('col_mode')+'</th><th style="padding:.3rem;text-align:right">'+t('col_actions')+'</th></tr></thead><tbody>';
+    __keys.forEach(k=>{
+      const acc=k.account_id?esc(k.account_name||k.account_id):('<span style="color:#f59e0b">'+t('unbound')+'</span>');
+      const en=k.enabled;
+      h+='<tr style="border-top:1px solid #334155;'+(en?'':'opacity:.5')+'">'
+        +'<td style="padding:.4rem">'+esc(k.name||k.id)+'</td>'
+        +'<td style="padding:.4rem"><code style="font-size:.72rem;color:#818cf8">'+esc(k.key.slice(0,10))+'…</code> <button onclick="copyKey(\\''+k.id+'\\')" style="font-size:.68rem;padding:2px 6px;background:#334155">'+t('btn_copy')+'</button></td>'
+        +'<td style="padding:.4rem">'+acc+'</td>'
+        +'<td style="padding:.4rem;color:#64748b">'+esc(k.tone)+'</td>'
+        +'<td style="padding:.4rem;text-align:right;white-space:nowrap">'
+        +'<button onclick="rebindKey(\\''+k.id+'\\')" style="font-size:.72rem;padding:3px 8px;background:#334155">'+t('btn_rebind')+'</button> '
+        +'<button onclick="toggleKey(\\''+k.id+'\\','+(en?'false':'true')+')" style="font-size:.72rem;padding:3px 8px;background:'+(en?'#b45309':'#059669')+'">'+(en?t('btn_disable'):t('btn_enable'))+'</button> '
+        +'<button onclick="delKey(\\''+k.id+'\\')" style="font-size:.72rem;padding:3px 8px;background:linear-gradient(135deg,#ef4444,#dc2626)">'+t('btn_delete')+'</button>'
+        +'</td></tr>';
+    });
+    h+='</tbody></table>';
+    box.innerHTML=h;
+  }catch(e){}
+}
+async function addKey(){
+  const name=prompt(t('key_prompt_name'));
+  if(name===null)return;
+  let account_id='';
+  if(__accounts.length){account_id=prompt(t('rebind_prompt')+'\\n'+__accounts.map(a=>a.id+' = '+(a.name||'')).join('\\n'))||''}
+  try{
+    const r=await fetch('/admin/keys',{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:name,account_id:account_id})});
+    if(!r.ok){const d=await r.json().catch(()=>({}));alert((d.error&&d.error.message)||'error');return}
+    loadKeys();loadAccounts();
+  }catch(e){}
+}
+function copyKey(id){
+  const k=__keys.find(x=>x.id===id);if(!k)return;
+  navigator.clipboard.writeText(k.key).then(()=>{},()=>{});
+}
+async function rebindKey(id){
+  const account_id=prompt(t('rebind_prompt')+'\\n'+__accounts.map(a=>a.id+' = '+(a.name||'')).join('\\n'));
+  if(account_id===null)return;
+  try{
+    const r=await fetch('/admin/keys/'+id,{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({account_id:account_id})});
+    if(!r.ok){const d=await r.json().catch(()=>({}));alert((d.error&&d.error.message)||'error');return}
+    loadKeys();loadAccounts();
+  }catch(e){}
+}
+async function toggleKey(id,enabled){
+  try{await fetch('/admin/keys/'+id,{method:'POST',credentials:'include',headers:{'Content-Type':'application/json'},body:JSON.stringify({enabled:enabled})});loadKeys()}catch(e){}
+}
+async function delKey(id){
+  if(!confirm(t('confirm_del_key')))return;
+  try{await fetch('/admin/keys/'+id,{method:'DELETE',credentials:'include'});loadKeys();loadAccounts()}catch(e){}
+}
+
 loadStatus();
 loadChromiumStatus();
 loadCallLog();
@@ -1943,6 +2447,8 @@ loadCapture();
 loadTone();
 loadToolPrompt();
 loadSystemPrompt();
+loadAccounts();
+loadKeys();
 setInterval(loadStatus,60000);
 setInterval(loadChromiumStatus,60000);
 setInterval(loadCallLog,5000);
@@ -2154,6 +2660,223 @@ async function resetSystemPrompt(){
   }catch(e){}
 }
 
+</script>
+</body>
+</html>"""
+
+
+_USER_HTML = """<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>M365 Copilot Proxy - User</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f172a;color:#e2e8f0;line-height:1.5}
+.wrap{max-width:760px;margin:0 auto;padding:1.5rem 1rem 3rem}
+h1{font-size:1.3rem;margin:0}
+.top{display:flex;align-items:center;justify-content:space-between;margin-bottom:1.2rem}
+.card{background:#1e293b;border:1px solid #334155;border-radius:10px;padding:1rem 1.2rem;margin-bottom:1rem}
+.card h2{font-size:1rem;margin:0 0 .8rem;color:#e2e8f0}
+label{display:block;font-size:.85rem;color:#94a3b8;margin:.6rem 0 .3rem}
+input,select,textarea{width:100%;background:#0f172a;border:1px solid #334155;border-radius:6px;color:#e2e8f0;padding:.5rem .6rem;font-size:.9rem;font-family:inherit}
+textarea{resize:vertical;min-height:70px}
+button{background:linear-gradient(135deg,#6366f1,#4f46e5);color:#fff;border:0;border-radius:6px;padding:.5rem 1rem;font-size:.9rem;cursor:pointer;margin-top:.6rem}
+button:disabled{opacity:.5;cursor:not-allowed}
+.btn-ghost{background:#334155}
+.row{display:flex;gap:.5rem;align-items:center}
+.row>*{margin-top:0}
+.pill{display:inline-block;font-size:.75rem;padding:.15rem .5rem;border-radius:99px;background:#334155;color:#cbd5e1}
+.pill.ok{background:#065f46;color:#d1fae5}
+.pill.bad{background:#7f1d1d;color:#fee2e2}
+.msg{font-size:.8rem;margin-left:.5rem;opacity:0;transition:opacity .2s;color:#86efac}
+.hint{font-size:.8rem;color:#64748b;margin-bottom:.4rem}
+.hidden{display:none}
+a{color:#818cf8}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <div class="top">
+    <h1 data-i18n="title">M365 Copilot 代理 · 用户</h1>
+    <button class="btn-ghost" id="lang-toggle" onclick="toggleLang()">&#127760; EN</button>
+  </div>
+
+  <div id="login-card" class="card">
+    <h2 data-i18n="login_title">登录</h2>
+    <div class="hint" data-i18n="login_hint">输入你的 API Key 以管理自己的对话模式、提示词与账户 Token。</div>
+    <input id="apikey" type="password" data-i18n-ph="apikey_ph" placeholder="sk-...">
+    <div class="row"><button id="login-btn" onclick="doLogin()" data-i18n="login_btn">登录</button><span id="login-msg" class="msg"></span></div>
+  </div>
+
+  <div id="app" class="hidden">
+    <div class="card">
+      <h2 data-i18n="account_title">账户与 Token</h2>
+      <div id="account-info"></div>
+      <label data-i18n="push_token_label">推送 / 更新账户 Token</label>
+      <div class="hint" data-i18n="push_token_hint">粘贴 access_token 值或完整 wss:// URL。若尚未绑定账户，将自动创建并绑定。</div>
+      <textarea id="acct-token" placeholder="access_token / wss://substrate.office.com/..."></textarea>
+      <div class="row"><button onclick="pushToken()" data-i18n="push_token_btn">推送 Token</button><span id="token-msg" class="msg"></span></div>
+    </div>
+
+    <div class="card">
+      <h2 data-i18n="tone_title">对话模式</h2>
+      <div class="row"><select id="tone" onchange="saveTone()"></select><span id="tone-msg" class="msg"></span></div>
+    </div>
+
+    <div class="card">
+      <h2 data-i18n="tool_prompt_title">提示词增强</h2>
+      <div class="hint" data-i18n="tool_prompt_hint">追加到工具调用提示词后的自定义指令，仅作用于你自己的 Key。留空则不追加。</div>
+      <textarea id="tool-prompt"></textarea>
+      <div class="row"><button onclick="saveToolPrompt()" data-i18n="save">保存</button><span id="tool-msg" class="msg"></span></div>
+    </div>
+
+    <details class="card">
+      <summary style="cursor:pointer;font-weight:600" data-i18n="sys_prompt_title">系统提示词（高级）</summary>
+      <div class="hint" style="margin-top:.6rem" data-i18n="sys_prompt_hint">覆盖工具调用的基础系统提示词。改错会导致工具调用失效，仅供高级用户调试。留空则使用内置默认。</div>
+      <textarea id="sys-prompt"></textarea>
+      <div class="row"><button onclick="saveSysPrompt()" data-i18n="save">保存</button><button class="btn-ghost" onclick="resetSysPrompt()" data-i18n="reset">恢复默认</button><span id="sys-msg" class="msg"></span></div>
+    </details>
+
+    <div class="card">
+      <h2 data-i18n="endpoints_title">API 端点</h2>
+      <div class="hint">Base URL: <code id="base-url"></code></div>
+      <div class="hint" data-i18n="endpoints_hint">在你的 OpenAI 兼容客户端里填入上面的 Base URL 和你的 API Key。</div>
+    </div>
+  </div>
+</div>
+
+<script>
+const i18n={
+  zh:{
+    title:'M365 Copilot 代理 · 用户',
+    login_title:'登录',login_hint:'输入你的 API Key 以管理自己的对话模式、提示词与账户 Token。',
+    apikey_ph:'sk-...',login_btn:'登录',login_failed:'登录失败，请检查 API Key',network_error:'网络错误',
+    account_title:'账户与 Token',push_token_label:'推送 / 更新账户 Token',
+    push_token_hint:'粘贴 access_token 值或完整 wss:// URL。若尚未绑定账户，将自动创建并绑定。',
+    push_token_btn:'推送 Token',saved:'已保存',push_ok:'Token 已更新',
+    tone_title:'对话模式',tool_prompt_title:'提示词增强',
+    tool_prompt_hint:'追加到工具调用提示词后的自定义指令，仅作用于你自己的 Key。留空则不追加。',
+    save:'保存',reset:'恢复默认',
+    sys_prompt_title:'系统提示词（高级）',
+    sys_prompt_hint:'覆盖工具调用的基础系统提示词。改错会导致工具调用失效，仅供高级用户调试。留空则使用内置默认。',
+    sys_prompt_reset_confirm:'确定要将系统提示词恢复为内置默认吗？当前自定义内容将被清空。',
+    endpoints_title:'API 端点',endpoints_hint:'在你的 OpenAI 兼容客户端里填入上面的 Base URL 和你的 API Key。',
+    logout:'登出',no_account:'尚未绑定账户，推送 Token 后将自动创建。',
+    key_name:'名称',bound_account:'绑定账户',token_valid:'有效',token_invalid:'无效/缺失',remaining:'剩余',
+  },
+  en:{
+    title:'M365 Copilot Proxy · User',
+    login_title:'Login',login_hint:'Enter your API key to manage your own conversation mode, prompts and account token.',
+    apikey_ph:'sk-...',login_btn:'Login',login_failed:'Login failed, check your API key',network_error:'Network error',
+    account_title:'Account & Token',push_token_label:'Push / update account token',
+    push_token_hint:'Paste the access_token value or the full wss:// URL. If no account is bound yet, one will be created and bound automatically.',
+    push_token_btn:'Push Token',saved:'Saved',push_ok:'Token updated',
+    tone_title:'Conversation Mode',tool_prompt_title:'Prompt Enhancement',
+    tool_prompt_hint:'Custom instruction appended after the tool-call prompt, applies only to your own key. Leave empty to append nothing.',
+    save:'Save',reset:'Restore default',
+    sys_prompt_title:'System Prompt (Advanced)',
+    sys_prompt_hint:'Overrides the base system prompt for tool calls. A wrong edit will break tool calling. For advanced debugging only. Leave empty to use the built-in default.',
+    sys_prompt_reset_confirm:'Restore the system prompt to the built-in default? Your current custom content will be cleared.',
+    endpoints_title:'API Endpoints',endpoints_hint:'Point your OpenAI-compatible client at the Base URL above with your API key.',
+    logout:'Logout',no_account:'No account bound yet. Pushing a token will create one automatically.',
+    key_name:'Name',bound_account:'Bound account',token_valid:'Valid',token_invalid:'Invalid/Missing',remaining:'Remaining',
+  }
+};
+let lang=localStorage.getItem('lang')||'zh';
+let toneOptions=[];
+let sysDefault='';
+function t(k){return i18n[lang][k]||k}
+function getKey(){return localStorage.getItem('user_api_key')||''}
+function authHeaders(){return {'Content-Type':'application/json','Authorization':'Bearer '+getKey()}}
+function applyLang(){
+  const btn=document.getElementById('lang-toggle');
+  btn.innerHTML=lang==='zh'?'&#127760; EN':'&#127760; 中文';
+  document.querySelectorAll('[data-i18n]').forEach(el=>{const k=el.getAttribute('data-i18n');if(i18n[lang][k])el.textContent=i18n[lang][k]});
+  document.querySelectorAll('[data-i18n-ph]').forEach(el=>{const k=el.getAttribute('data-i18n-ph');if(i18n[lang][k])el.placeholder=i18n[lang][k]});
+  renderToneOptions();
+}
+function toggleLang(){lang=lang==='zh'?'en':'zh';localStorage.setItem('lang',lang);applyLang()}
+function renderToneOptions(){
+  const sel=document.getElementById('tone');if(!sel||!toneOptions.length)return;
+  const cur=sel.value;
+  sel.innerHTML='';
+  toneOptions.forEach(o=>{
+    const opt=document.createElement('option');
+    opt.value=o.value;
+    opt.textContent=lang==='zh'?(o.label_zh||o.label):(o.label_en||o.label);
+    sel.appendChild(opt);
+  });
+  if(cur)sel.value=cur;
+}
+function flash(id){const s=document.getElementById(id);if(!s)return;s.textContent=t('saved');s.style.opacity='1';setTimeout(()=>{s.style.opacity='0'},1500)}
+async function doLogin(){
+  const key=document.getElementById('apikey').value.trim();
+  const msg=document.getElementById('login-msg');
+  if(!key)return;
+  localStorage.setItem('user_api_key',key);
+  const ok=await loadMe();
+  if(!ok){msg.className='msg';msg.style.color='#fca5a5';msg.style.opacity='1';msg.textContent=t('login_failed');localStorage.removeItem('user_api_key')}
+}
+function logout(){localStorage.removeItem('user_api_key');document.getElementById('app').classList.add('hidden');document.getElementById('login-card').classList.remove('hidden')}
+async function loadMe(){
+  if(!getKey())return false;
+  try{
+    const r=await fetch('/user/me',{headers:authHeaders()});
+    if(!r.ok)return false;
+    const d=await r.json();
+    toneOptions=d.tone_options||[];
+    sysDefault=d.default_system_prompt||'';
+    document.getElementById('login-card').classList.add('hidden');
+    document.getElementById('app').classList.remove('hidden');
+    document.getElementById('base-url').textContent=location.origin+'/v1';
+    renderToneOptions();
+    document.getElementById('tone').value=d.tone||'Magic';
+    document.getElementById('tool-prompt').value=d.tool_prompt||'';
+    document.getElementById('sys-prompt').value=d.system_prompt||'';
+    let acc='';
+    if(d.account){
+      const st=d.account.token_status||{};
+      const valid=st.valid;
+      const rem=valid?(' · '+t('remaining')+' '+Math.floor((st.seconds_remaining||0)/60)+'m'):'';
+      acc='<div class="row" style="flex-wrap:wrap;gap:.4rem"><span class="pill">'+t('bound_account')+': '+(d.account.name||d.account.id)+'</span>'
+        +'<span class="pill '+(valid?'ok':'bad')+'">'+(valid?t('token_valid'):t('token_invalid'))+rem+'</span></div>';
+    }else{
+      acc='<div class="hint">'+t('no_account')+'</div>';
+    }
+    acc+='<div style="margin-top:.6rem"><button class="btn-ghost" onclick="logout()">'+t('logout')+'</button></div>';
+    document.getElementById('account-info').innerHTML=acc;
+    return true;
+  }catch(e){return false}
+}
+async function pushToken(){
+  const token=document.getElementById('acct-token').value.trim();
+  if(!token)return;
+  try{
+    const r=await fetch('/user/account/token',{method:'POST',headers:authHeaders(),body:JSON.stringify({token:token})});
+    if(r.ok){document.getElementById('acct-token').value='';flash('token-msg');loadMe()}
+  }catch(e){}
+}
+async function saveTone(){
+  const tone=document.getElementById('tone').value;
+  try{await fetch('/user/tone',{method:'POST',headers:authHeaders(),body:JSON.stringify({tone:tone})});flash('tone-msg')}catch(e){}
+}
+async function saveToolPrompt(){
+  const p=document.getElementById('tool-prompt').value;
+  try{await fetch('/user/tool-prompt',{method:'POST',headers:authHeaders(),body:JSON.stringify({tool_prompt:p})});flash('tool-msg')}catch(e){}
+}
+async function saveSysPrompt(){
+  const p=document.getElementById('sys-prompt').value;
+  try{await fetch('/user/system-prompt',{method:'POST',headers:authHeaders(),body:JSON.stringify({system_prompt:p})});flash('sys-msg')}catch(e){}
+}
+async function resetSysPrompt(){
+  if(!confirm(t('sys_prompt_reset_confirm')))return;
+  document.getElementById('sys-prompt').value='';
+  try{await fetch('/user/system-prompt',{method:'POST',headers:authHeaders(),body:JSON.stringify({system_prompt:''})});flash('sys-msg')}catch(e){}
+}
+applyLang();
+loadMe();
 </script>
 </body>
 </html>"""

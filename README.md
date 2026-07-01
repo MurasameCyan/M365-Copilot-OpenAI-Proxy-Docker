@@ -1,11 +1,17 @@
-# Ciallo Ms-365 OpenAI Proxy Docker
+# Ciallo Ms-365 OpenAI Proxy Docker · 多租户版（Multi-Account）
 
 来都来了 不点个⭐再走吗~?
 
-将 Microsoft 365 Copilot 暴露为 OpenAI 兼容 API 的 Docker 代理服务。
+将 Microsoft 365 Copilot 暴露为 OpenAI 兼容 API 的 Docker 代理服务。**多租户版**：可管理多个 M365 账户与多个 API Key，给多人共用，每个 Key 绑定一个账户并拥有独立的对话模式与提示词。
+
+> 这是主项目的 `multi` 分支，镜像标签为 `:multi`。单租户（单账户单 Key）请用 `main` 分支 / `:latest` 镜像。
 
 基于 [m365-copilot-openai-proxy](https://github.com/kuchris/m365-copilot-openai-proxy)，封装为 Docker 镜像，支持：
 
+- **多账户池** — 每个账户拥有独立 M365 Token 与 Chromium 刷新配置
+- **多 API Key** — 每个 Key 绑定一个账户，可单独设置对话模式 / 提示词，随时启用停用
+- **按需串行刷新** — 刷新时按需拉起单个 Chromium、用完即关，峰值内存接近单租户
+- **分层界面** — `/admin` 运营总控台（账户池 + Key 管理），`/` 用户自助页（用自己的 Key 管理对话模式、提示词、账户 Token）
 - 按需刷新 Token 降低账号风险（空闲自动暂停，有请求时自动唤醒）
 - Tampermonkey 油猴脚本一键推送 Token + Cookie
 - 对话模式切换（自动 / 快速答复 / 深度思考 / GPT 5.5 / GPT 5.2）
@@ -87,6 +93,24 @@ Web 管理页面显示 Token 有效性和 Chromium 登录状态。点击 **Check
 | `GET POST /admin/system-prompt`         | 查询 / 设置系统提示词        |
 | `GET POST /admin/capture-payload`       | 查询 / 接收模式抓包数据      |
 | `POST /admin/login`                     | Web 管理页面登录             |
+| `GET POST /admin/accounts`              | 列出 / 添加账户              |
+| `POST /admin/accounts/{id}/token`       | 更新账户 Token               |
+| `POST /admin/accounts/{id}/rename`      | 重命名账户                   |
+| `POST /admin/accounts/{id}/refresh`     | 立即刷新账户 Token（CDP）    |
+| `DELETE /admin/accounts/{id}`           | 删除账户（解绑其 Key）       |
+| `GET POST /admin/keys`                  | 列出 / 新建 API Key          |
+| `POST /admin/keys/{id}`                 | 更新 Key（绑定/模式/启停等） |
+| `DELETE /admin/keys/{id}`               | 删除 API Key                 |
+
+### 用户自助端点（用自己的 API Key 认证）
+
+| 端点                          | 说明                                    |
+| ----------------------------- | --------------------------------------- |
+| `GET /user/me`              | 查询自己的 Key 信息与绑定账户状态       |
+| `POST /user/tone`           | 设置自己的对话模式                      |
+| `POST /user/tool-prompt`    | 设置自己的提示词增强                    |
+| `POST /user/system-prompt`  | 设置自己的系统提示词                    |
+| `POST /user/account/token`  | 推送/更新自己绑定账户的 Token（无则自动创建） |
 
 ## 按需刷新机制
 
@@ -164,7 +188,27 @@ curl -H "Authorization: Bearer YOUR_SECRET_KEY" http://localhost:8000/v1/models
 
 ### Web 管理页面
 
-访问 Web 管理页面时需输入管理密码。密码通过 `ADMIN_PASSWORD` 环境变量设置，如果未设置则使用 `API_KEY` 作为密码，登录后 Cookie 有效期 7 天。
+访问 `/admin` 运营总控台时需输入管理密码。密码通过 `ADMIN_PASSWORD` 环境变量设置，如果未设置则使用 `API_KEY` 作为密码，登录后 Cookie 有效期 7 天。
+
+## 多租户使用
+
+分层界面：
+
+- **`/admin` 运营总控台**（管理密码登录）：管理账户池与所有 API Key。可添加账户、推送/刷新账户 Token、新建 Key 并绑定账户、设置各 Key 的对话模式、随时启用/停用或删除 Key。
+- **`/` 用户自助页**（用自己的 API Key 登录）：普通使用者用分到的 Key 登录，管理自己的对话模式、提示词增强、系统提示词，并可自助推送/更新绑定账户的 Token（未绑定账户时自动创建并绑定）。
+
+典型流程（方案 B，每 Key 绑定一个账户）：
+
+1. 运营方在 `/admin` 添加账户（可当场粘贴该账户 Token，或留空稍后由用户/CDP 推送）
+2. 新建 API Key 并绑定到某账户，把 Key 发给对应使用者
+3. 使用者在 `/` 用自己的 Key 登录，按需自助推送账户 Token、调整对话模式与提示词
+4. 在 OpenAI 兼容客户端里填入 Base URL（`http://<host>:8000/v1`）与自己的 API Key 即可使用
+
+数据持久化：账户池 `accounts.json`、Key 表 `keys.json`、会话 `sessions.json` 均写入 `TOKEN_DIR`（挂载卷），容器重启不丢。各账户会话按 Key 维度隔离，不同 Key 即使开场白相同也不会串会话。
+
+### 内存与刷新
+
+保留 CDP 自动刷新，但采用**按需串行**策略：平时账户只在磁盘/内存存 Token，无浏览器进程；某账户 Token 临近过期且有请求时，才拉起它专属的 Chromium profile（独立 CDP 端口）抓取新 Token，随即关闭。串行队列保证同一时刻最多一个 Chromium 存活，因此多账户下峰值内存仍接近单租户（约数百 MB，而非账户数 × 300MB）。
 
 ## 持久会话与上下文优化
 
@@ -227,10 +271,12 @@ M365 Copilot 支持多种模型 / 思考模式，由 Substrate 请求中的 `ton
   │   └─ 通过 CDP 自动捕获 Substrate WebSocket Token
   │
   └─ ciallo-ms365-proxy serve (端口 8000)
-      ├─ /v1/* — OpenAI 兼容 API（按需刷新 + 同步 CDP 刷新）
-      ├─ /admin/* — 管理端点（Token/Cookie/Login 管理）
-      ├─ Web 管理页面 (/)
-      └─ 按需刷新：启动暂停 → /v1/ 请求同步刷新 → 空闲暂停
+      ├─ /v1/* — OpenAI 兼容 API（按 API Key 解析账户 → per-key tone/提示词）
+      ├─ /admin/* — 运营总控台端点（账户池 + Key 管理 + Token/Cookie/Login）
+      ├─ /user/* — 用户自助端点（用自己的 Key 管理模式/提示词/账户 Token）
+      ├─ /admin — 运营总控台页面（管理密码登录）
+      ├─ / — 用户自助页面（API Key 登录）
+      └─ 按需串行刷新：每账户独立 profile/端口，同一时刻最多一个 Chromium
 ```
 
 ## 预览
